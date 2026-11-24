@@ -113,7 +113,7 @@ class FakeEbusdClient:
             },
         )
 
-    async def definitions(self, circuit: str) -> list[Definition]:
+    async def definitions(self, circuit: str, write: bool = False) -> list[Definition]:
         return list(self.defs.get(circuit, []))
 
     async def probe_write(self, telegram: str) -> str:

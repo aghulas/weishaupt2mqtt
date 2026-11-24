@@ -186,9 +186,9 @@ class WeishauptEngine:
         loaded: dict[str, list[Any]] = {}
         for circuit in self.present_circuits:
             try:
-                loaded[circuit] = await self.client.definitions(circuit)
+                loaded[circuit] = await self.client.definitions(circuit, write=True)
             except EbusdError as err:
-                _LOGGER.debug("Could not load definitions for %s: %s", circuit, err)
+                _LOGGER.debug("Could not load write definitions for %s: %s", circuit, err)
                 loaded[circuit] = []
 
         self.specs, _not_writable, self.placeholders = write_specs(self.model, loaded)
@@ -259,7 +259,7 @@ class WeishauptEngine:
                 if msg.poll not in poll_classes:
                     continue
                 try:
-                    max_age = 0 if msg.passive else int(self.config.poll_cyclic_interval)
+                    max_age = 3600 if msg.passive else int(self.config.poll_cyclic_interval)
                     raw = await self.client.read(circuit, msg.name, max_age=max_age)
                 except (EbusdNoData, EbusdNotFound):
                     continue
