@@ -42,8 +42,10 @@ class Config:
     # Polling intervals (seconds)
     poll_passive_interval: float = 15.0
     poll_cyclic_interval: float = 60.0
-    poll_program_interval: float = 300.0
-    poll_faults_interval: float = 300.0
+    poll_program_interval: float = 3600.0
+    poll_faults_interval: float = 3600.0
+    program_cache_age: int = 86400
+    faults_cache_age: int = 86400
 
     # Writes & safety
     writes_enabled: bool = False

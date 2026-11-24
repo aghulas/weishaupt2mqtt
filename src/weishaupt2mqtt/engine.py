@@ -301,7 +301,7 @@ class WeishauptEngine:
                         if msg.write and getattr(msg.write, "stored_only", False):
                             stored_only = True
                         try:
-                            raw_fields = await self.client.read(circuit, msg.name, max_age=int(self.config.poll_program_interval))
+                            raw_fields = await self.client.read(circuit, msg.name, max_age=self.config.program_cache_age)
                         except EbusdError:
                             continue
                         raw_val = raw_of_fields(raw_fields)
@@ -341,7 +341,7 @@ class WeishauptEngine:
                     continue
                 if msg.family in ("fault_history", "fault_counters") or msg.name == "FaultPointer":
                     try:
-                        raw_map[msg.key] = await self.client.read(circuit, msg.name, max_age=int(self.config.poll_faults_interval))
+                        raw_map[msg.key] = await self.client.read(circuit, msg.name, max_age=self.config.faults_cache_age)
                     except EbusdError:
                         continue
 
@@ -351,8 +351,8 @@ class WeishauptEngine:
             )
             pointer_vals = raw_map.get(f"{circuit}/FaultPointer")
             pointer = pointer_vals[0] if pointer_vals else None
-            history_list = faults.history(self.model, raw_map, hist_group, pointer) if hist_group else []
-            counters_list = faults.counters(self.model, raw_map, circuit)
+            history_list = faults.history(self.model, raw_map.get, hist_group, pointer) if hist_group else []
+            counters_list = faults.counters(self.model, raw_map.get, circuit)
 
             payload = {
                 "circuit": circuit,
