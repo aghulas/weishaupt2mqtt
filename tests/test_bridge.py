@@ -336,6 +336,25 @@ class TestWeishaupt2Mqtt(unittest.IsolatedAsyncioTestCase):
             persisted = json.loads(sf.read_text(encoding="utf-8"))
             self.assertEqual(persisted, {"writes_enabled": True, "installer_writes_enabled": True})
 
+    def test_supervisor_mqtt_auto_discovery(self) -> None:
+        import os
+        from unittest.mock import MagicMock, patch
+
+        with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "mock-token"}):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                mock_resp = MagicMock()
+                mock_resp.read.return_value = (
+                    b'{"result": "ok", "data": {"host": "core-mosquitto", "port": 1883, '
+                    b'"username": "auto-user", "password": "auto-password"}}'
+                )
+                mock_resp.__enter__.return_value = mock_resp
+                mock_urlopen.return_value = mock_resp
+
+                cfg = Config.from_sources()
+                self.assertEqual(cfg.mqtt_username, "auto-user")
+                self.assertEqual(cfg.mqtt_password, "auto-password")
+                self.assertEqual(cfg.mqtt_host, "core-mosquitto")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,25 @@ def _find_default_metadata() -> Path:
 DEFAULT_METADATA_PATH = _find_default_metadata()
 
 
+def _fetch_supervisor_mqtt() -> dict[str, Any]:
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return {}
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://supervisor/services/mqtt",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("result") == "ok":
+                return data.get("data", {})
+    except Exception:
+        pass
+    return {}
+
+
 def _bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -88,14 +107,30 @@ class Config:
         state_val = get("state_file", "WEISHAUPT_STATE_FILE", None)
         base_topic = str(get("base_topic", "WEISHAUPT_BASE_TOPIC", "weishaupt")).strip("/") or "weishaupt"
 
+        user_val = get("mqtt_username", "MQTT_USERNAME", None) or None
+        pass_val = get("mqtt_password", "MQTT_PASSWORD", None) or None
+        host_val = str(get("mqtt_host", "MQTT_HOST", "127.0.0.1"))
+        port_val = int(get("mqtt_port", "MQTT_PORT", 1883))
+
+        # Auto-discover credentials from Home Assistant Supervisor MQTT service if not explicitly configured
+        if not user_val:
+            svc_mqtt = _fetch_supervisor_mqtt()
+            if svc_mqtt.get("username"):
+                user_val = svc_mqtt.get("username")
+                pass_val = svc_mqtt.get("password")
+                if host_val in ("127.0.0.1", "localhost", "core-mosquitto") and svc_mqtt.get("host"):
+                    host_val = str(svc_mqtt.get("host"))
+                if port_val == 1883 and svc_mqtt.get("port"):
+                    port_val = int(svc_mqtt.get("port"))
+
         return cls(
             ebusd_host=str(get("ebusd_host", "EBUSD_HOST", "127.0.0.1")),
             ebusd_port=int(get("ebusd_port", "EBUSD_PORT", 8888)),
             ebusd_timeout=float(get("ebusd_timeout", "EBUSD_TIMEOUT", 10.0)),
-            mqtt_host=str(get("mqtt_host", "MQTT_HOST", "127.0.0.1")),
-            mqtt_port=int(get("mqtt_port", "MQTT_PORT", 1883)),
-            mqtt_username=get("mqtt_username", "MQTT_USERNAME", None) or None,
-            mqtt_password=get("mqtt_password", "MQTT_PASSWORD", None) or None,
+            mqtt_host=host_val,
+            mqtt_port=port_val,
+            mqtt_username=user_val,
+            mqtt_password=pass_val,
             base_topic=base_topic,
             metadata_path=Path(metadata_val),
             poll_passive_interval=float(get("poll_passive_interval", "POLL_PASSIVE_INTERVAL", 15.0)),

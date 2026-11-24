@@ -27,6 +27,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+if [ -n "${SUPERVISOR_TOKEN:-}" ]; then
+    echo "Supervisor token detected, checking for MQTT service..."
+    MQTT_SERVICE_JSON=$(curl -sSL -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/services/mqtt 2>/dev/null || true)
+    if [ "$(echo "${MQTT_SERVICE_JSON}" | jq -r '.result // empty' 2>/dev/null)" = "ok" ]; then
+        echo "Supervisor MQTT service available."
+    fi
+fi
+
 if [ "${EBUSD_EXTERNAL}" != "true" ]; then
     if [ -z "${EBUS_DEVICE}" ]; then
         echo "ERROR: EBUS_DEVICE is required unless EBUSD_EXTERNAL=true" >&2
