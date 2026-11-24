@@ -1,6 +1,7 @@
 """Core Weishaupt engine: ebusd polling, decoding, and guarded level-1/level-2 writes."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -162,12 +163,24 @@ class WeishauptEngine:
         except OSError as err:
             _LOGGER.warning("Could not persist switch state to %s: %s", path, err)
 
-    async def start(self) -> None:
+    async def start(self, *, wait_for_slaves: bool = False) -> None:
         """Query ebusd info, load definitions for present circuits, and probe write capability."""
         self.info = await self.client.info()
         slave_addresses = {
             a.address for a in self.info.addresses.values() if a.role == "slave" and not a.own
         }
+        if wait_for_slaves and 0 < len(slave_addresses) < 6:
+            for _ in range(5):
+                await asyncio.sleep(2.0)
+                self.info = await self.client.info()
+                new_slaves = {
+                    a.address for a in self.info.addresses.values() if a.role == "slave" and not a.own
+                }
+                if len(new_slaves) >= 6 or len(new_slaves) == len(slave_addresses):
+                    slave_addresses = new_slaves
+                    break
+                slave_addresses = new_slaves
+
         present_devices = self.model.present_devices(slave_addresses)
         circuits: list[str] = []
         for dev in present_devices.values():
@@ -211,6 +224,34 @@ class WeishauptEngine:
                 self.checksum_capability = "unknown"
         else:
             self.checksum_capability = "unknown"
+
+    async def refresh_devices(self) -> list[str]:
+        """Check for newly discovered slave devices and load definitions if any new circuit appears."""
+        try:
+            self.info = await self.client.info()
+        except EbusdError:
+            return []
+        slave_addresses = {
+            a.address for a in self.info.addresses.values() if a.role == "slave" and not a.own
+        }
+        present_devices = self.model.present_devices(slave_addresses)
+        new_circuits: list[str] = []
+        for dev in present_devices.values():
+            for c in dev.circuits:
+                if c.circuit not in self.present_circuits:
+                    self.present_circuits.append(c.circuit)
+                    new_circuits.append(c.circuit)
+        if new_circuits:
+            loaded: dict[str, list[Any]] = {}
+            for circuit in self.present_circuits:
+                try:
+                    loaded[circuit] = await self.client.definitions(circuit, write=True)
+                except EbusdError:
+                    loaded[circuit] = []
+            self.specs, _not_writable, self.placeholders = write_specs(self.model, loaded)
+            self.programs, self.slot_specs, _prog_issues = program_specs(self.model, loaded)
+            _LOGGER.info("Discovered new circuits: %s (total %s)", new_circuits, self.present_circuits)
+        return new_circuits
 
     def bridge_info(self) -> dict[str, Any]:
         """Payload for `weishaupt/bridge/info`."""

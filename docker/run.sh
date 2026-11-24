@@ -63,8 +63,8 @@ if [ "${EBUSD_EXTERNAL}" != "true" ]; then
         fi
         sleep 1
     done
-    # Give ebusd a short moment to complete initial bus scan
-    sleep 5
+    # Give ebusd time to complete initial broadcast scan of all slave devices
+    sleep 25
 fi
 
 exec python3 -m weishaupt2mqtt --log-level "${LOG_LEVEL}" "${OPT_ARGS[@]}"

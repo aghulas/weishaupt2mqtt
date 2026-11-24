@@ -222,7 +222,7 @@ async def run_forever(config: Config) -> None:
     import aiomqtt
 
     engine = WeishauptEngine(config)
-    await engine.start()
+    await engine.start(wait_for_slaves=True)
     _LOGGER.info(
         "Connected to ebusd (%s), definitions %s, circuits=%s, checksum=%s",
         engine.info.version if engine.info else "?",
@@ -252,6 +252,9 @@ async def run_forever(config: Config) -> None:
                         for c in await engine.poll_messages(("passive",)):
                             await bridge.publish_circuit_state(c)
                         if tick % max(1, int(config.poll_cyclic_interval / max(1.0, config.poll_passive_interval))) == 0:
+                            new_c = await engine.refresh_devices()
+                            if new_c:
+                                await bridge.publish_bridge_info()
                             for c in await engine.poll_messages(("cyclic",)):
                                 await bridge.publish_circuit_state(c)
                         if tick % max(1, int(config.poll_program_interval / max(1.0, config.poll_passive_interval))) == 0:
