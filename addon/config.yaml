@@ -1,0 +1,46 @@
+name: Weishaupt2MQTT
+version: "0.1.0"
+slug: weishaupt2mqtt
+description: All-in-one Weishaupt eBUS to functional MQTT bridge (bundles ebusd, definitions, and write guards)
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+services:
+  - mqtt:want
+options:
+  ebusd_external: false
+  ebus_device: ""
+  ebusd_address: "31"
+  ebusd_host: "127.0.0.1"
+  ebusd_port: 8888
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  base_topic: "weishaupt"
+  writes_enabled: false
+  installer_writes_enabled: false
+  allow_stock_ebusd: false
+  max_writes_per_hour: 30
+  clock_sync_enabled: false
+  log_level: "INFO"
+schema:
+  ebusd_external: bool
+  ebus_device: str
+  ebusd_address: str
+  ebusd_host: str
+  ebusd_port: port
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password?
+  base_topic: str
+  writes_enabled: bool
+  installer_writes_enabled: bool
+  allow_stock_ebusd: bool
+  max_writes_per_hour: int(1,200)
+  clock_sync_enabled: bool
+  log_level: list(DEBUG|INFO|WARNING|ERROR)

@@ -1,0 +1,248 @@
+"""What may be written, and the bytes of a write. No Home Assistant dependency.
+
+A setting is writable only when the metadata of the definitions release gives it write conditions (a lot proves
+the write, an evidence record names it) and ebusd loaded its write definition as the release has it. Structural
+settings never have write conditions; anything else in the metadata stays read-only.
+
+The telegram of a write is built here, byte for byte, and sent with `write -c <circuit> -h <bytes>`: ebusd sends it
+only when the bytes match the write definition it loaded for that circuit, the run-time checksum included on a
+build that has it (john30/ebusd#1825). A register write is `ZZ 50 23 05 <crc> <addr> <sub> <low> <high>`: one 16-bit
+register per telegram, value low byte first, `<crc>` a CRC-8 (polynomial 0x5C) over the four bytes after it
+(`evidence/register-write-crc.md` of the definitions).
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+from .ebusd import Definition
+from .model import Message, Model, single_setting
+
+PBSB = "5023"
+WCRC_MARKER = "[WCRC]"
+
+# Linked bounds, which no record of the definitions states yet (the contract, docs/companion-contract.md of the
+# workbench, says so; the ranges are those of evidence/settings-writes.md): on one circuit the setback room
+# temperature stays at or below the normal one, the minimum flow temperature at or below the maximum. (lower,
+# upper) message names. Held here for this beta: when the metadata carries linked bounds, they replace these.
+LINKED: tuple[tuple[str, str], ...] = (
+    ("RoomSetbackTemp", "RoomNormalTemp"),
+    ("SupplyMinTemp", "SupplyMaxTemp"),
+)
+TYPES = {"UIN": (0, 0xFFFE), "SIN": (-0x7FFF, 0x7FFF)}  # 0xffff and 0x8000 are the replacement values
+RISKS = ("comfort", "regulation")  # structural settings are never in the metadata's write conditions
+
+
+def crc(data: bytes) -> int:
+    """CRC-8, polynomial 0x5C, initial value the first byte, over all the bytes given."""
+    value = data[0]
+    for byte in data[1:]:
+        for _ in range(8):
+            value = ((value << 1) ^ 0x5C) & 0xFF if value & 0x80 else (value << 1) & 0xFF
+        value ^= byte
+    return value
+
+
+def round_half_away(value: float) -> int:
+    """How ebusd turns a value times its divisor into an integer."""
+    return int(math.floor(abs(value) + 0.5)) * (1 if value >= 0 else -1)
+
+
+@dataclass(frozen=True)
+class WriteSpec:
+    """A writable setting, as the metadata describes it and ebusd loaded it."""
+
+    key: str  # <circuit>/<name>
+    circuit: str
+    name: str
+    zz: str  # target address
+    register: str  # address and sub-address, 4 hex digits ("2500")
+    type: str  # "UIN" or "SIN"
+    divisor: int
+    minimum: float
+    maximum: float
+    step: float
+    unit: str | None
+    source: str  # "ff" or "31"
+    risk: str  # "comfort" or "regulation"
+    proof: str
+    open: tuple[str, ...]
+    bounds_from: str  # "definitions": the range of the field (CSV); "metadata": the range of the write conditions
+    range_source: str | None = None  # where the metadata took a range of the write conditions from
+    values: dict[int, str] | None = None  # value list: raw value -> ebusd name (a select), None for a number
+    value_labels: dict[int, dict[str, str]] | None = None  # raw value -> label per language
+    below: str | None = None  # sibling message on the same circuit this setting must stay at or below (0.8.0+)
+    above: str | None = None  # sibling message on the same circuit this setting must stay at or above (0.8.0+)
+
+    @property
+    def decimals(self) -> int:
+        """Decimals of a value of this setting: those of its step (0.5 -> 1, 1 or 10 -> 0)."""
+        text = f"{self.step:g}"
+        return len(text.split(".")[1]) if "." in text else 0
+
+    @property
+    def ebusd_source(self) -> str | None:
+        """The `-s` of the write command: "ff" for a setting proven from the address of the vendor service tool,
+        None (ebusd's own address) for one proven from 31. Taken from the metadata, never decided here."""
+        return "ff" if self.source == "ff" else None
+
+    @property
+    def register_id(self) -> str:
+        """Key of the rate limit: the device register, whatever circuit name it is reached through."""
+        return f"{self.zz}:{self.register}"
+
+    def raw(self, value: float) -> int:
+        """Register value for `value` (the value times the divisor, rounded as ebusd does)."""
+        raw = round_half_away(value * self.divisor)
+        low, high = TYPES[self.type]
+        if not low <= raw <= high:
+            raise ValueError(f"{value} does not fit the type {self.type}")
+        return raw
+
+    def value_of(self, raw: int) -> float:
+        return raw / self.divisor if self.divisor > 1 else float(raw)
+
+    def raw_of_text(self, text: str) -> int | None:
+        """Register value of what ebusd answers to a read of the setting (a number, or the ebusd name of an entry
+        of the value list), None when it is neither."""
+        if self.values is not None:
+            return next((raw for raw, name in self.values.items() if name == text), None)
+        try:
+            return round_half_away(float(text) * self.divisor)
+        except ValueError:
+            return None
+
+    def raw_of_values(self, values: tuple[str, ...]) -> int | None:
+        """Register value from all the fields ebusd answers (one, for a setting)."""
+        return self.raw_of_text(values[0]) if values else None
+
+    def on_step(self, value: float) -> bool:
+        if self.values is not None:
+            return value == int(value) and int(value) in self.values
+        steps = (value - self.minimum) / self.step
+        return abs(steps - round(steps)) < 1e-6
+
+    def telegram(self, value: float) -> str:
+        """Target, command, length and data in hex, as `write -h` takes them: `15502305282500` + `0100`."""
+        raw = self.raw(value) & 0xFFFF
+        body = bytes.fromhex(self.register) + raw.to_bytes(2, "little")
+        return f"{self.zz}{PBSB}05{crc(body):02x}{body.hex()}"
+
+    def placeholder_telegram(self, value: float, placeholder: str) -> str:
+        """The same telegram with the checksum byte of the definition (the checksum of the address alone)."""
+        telegram = self.telegram(value)
+        return telegram[:8] + placeholder + telegram[10:]
+
+
+@dataclass(frozen=True)
+class NotWritable:
+    key: str
+    reason: str
+    exposed: bool = True  # False: a kind of write this version does not offer (program slots, date and time)
+
+
+def write_specs(model: Model, loaded: dict[str, list[Definition]]) -> tuple[dict[str, WriteSpec],
+                                                                             list[NotWritable], dict[str, str]]:
+    """Specs of the settings the metadata marks writable and ebusd loaded as expected (`loaded`: circuit -> the
+    write definitions of `find -f -w`), the settings left read-only with the reason, and the checksum byte of
+    each definition (the placeholder ebusd replaces when it has the run-time checksum)."""
+    specs, refused, placeholders = {}, [], {}
+    for message in model.messages.values():
+        if message.write is None:
+            continue
+        if message.shared_with:
+            # this device reads the value from another one's store: a write here is acknowledged and not kept
+            refused.append(NotWritable(message.key, f"kept by {message.shared_with}: changed there"))
+            continue
+        if single_setting(message) is None:
+            refused.append(NotWritable(message.key, "not offered by this version (several fields)", False))
+            continue
+        spec, reason, placeholder = _spec(message, loaded.get(message.circuit, []))
+        if spec is None:
+            refused.append(NotWritable(message.key, reason))
+        else:
+            specs[message.key] = spec
+            placeholders[message.key] = placeholder
+    return specs, refused, placeholders
+
+
+def _spec(message: Message, definitions: list[Definition]) -> tuple[WriteSpec | None, str, str]:
+    conditions = message.write
+    assert conditions is not None
+    if conditions.risk not in RISKS:
+        return None, f"risk class {conditions.risk!r}", ""
+    if conditions.source not in ("ff", "31"):
+        return None, f"source {conditions.source!r}", ""
+    fields = [f for f in message.fields if f.shown]
+    if len(fields) != 1 or fields[0].type not in TYPES:
+        return None, "not one 16-bit number", ""
+    fld = fields[0]
+    definition = next((d for d in definitions if d.name == message.name and d.direction == "w"), None)
+    if definition is None:
+        return None, "ebusd did not load its write definition", ""
+    loaded_fields = [f for f in definition.fields if not f.type.startswith("IGN")]
+    divisor = fld.divisor or 1
+    if fld.values:
+        expected = ";".join(f"{raw}={name}" for raw, name in sorted(fld.values.items(), key=lambda i: int(i[0])))
+    else:
+        expected = "" if divisor == 1 else str(divisor)
+    if (definition.pbsb.lower() != PBSB or definition.zz.lower() != message.address.lower()
+            or len(definition.id) != 6 or WCRC_MARKER not in definition.comment
+            or len(loaded_fields) != 1 or loaded_fields[0].type != fld.type
+            or loaded_fields[0].divisor_or_values != expected):
+        return None, "ebusd loaded another write definition", ""
+    if fld.values:  # a choice: its value list is its range
+        values = {int(raw): name for raw, name in fld.values.items()}
+        labels = {int(raw): label for raw, label in (fld.value_labels or {}).items()}
+        spec = WriteSpec(message.key, message.circuit, message.name, message.address.lower(),
+                         definition.id[2:].lower(), fld.type, 1, float(min(values)), float(max(values)), 1.0, None,
+                         conditions.source, conditions.risk, conditions.proof, tuple(conditions.open), "definitions",
+                         None, values, labels)
+        return spec, "", definition.id[:2].lower()
+    # The range of the field (the CSV of the definitions); where the CSV cannot hold one (fractional bounds),
+    # the range of the write conditions (metadata from 0.5.5 on). No range: not writable. Nothing here supplies one.
+    minimum, maximum, step, bounds_from = fld.minimum, fld.maximum, fld.step, "definitions"
+    if minimum is None or maximum is None:
+        if conditions.minimum is None or conditions.maximum is None:
+            return None, "no range", ""
+        minimum, maximum, step, bounds_from = conditions.minimum, conditions.maximum, conditions.step, "metadata"
+    if step is None:
+        step = 1.0 if divisor == 1 else 1.0 / divisor
+    spec = WriteSpec(message.key, message.circuit, message.name, message.address.lower(), definition.id[2:].lower(),
+                     fld.type, divisor, float(minimum), float(maximum), float(step), fld.unit, conditions.source,
+                     conditions.risk, conditions.proof, tuple(conditions.open), bounds_from,
+                     conditions.range_source if bounds_from == "metadata" else None,
+                     below=conditions.below, above=conditions.above)
+    return spec, "", definition.id[:2].lower()
+
+
+def linked(spec: WriteSpec, specs: dict[str, WriteSpec]) -> tuple[WriteSpec | None, WriteSpec | None]:
+    """(setting this one must stay at or above, setting it must stay at or below), on the same circuit.
+    Uses `above` / `below` from the metadata (0.8.0+) when present, falling back to `LINKED` for older metadata."""
+    if spec.above is not None or spec.below is not None:
+        return (
+            specs.get(f"{spec.circuit}/{spec.above}") if spec.above else None,
+            specs.get(f"{spec.circuit}/{spec.below}") if spec.below else None,
+        )
+    below = above = None
+    for lower, upper in LINKED:
+        if spec.name == upper:
+            below = specs.get(f"{spec.circuit}/{lower}")
+        if spec.name == lower:
+            above = specs.get(f"{spec.circuit}/{upper}")
+    return below, above
+
+
+def capability(matched_correct: str, matched_placeholder: str) -> str:
+    """Whether ebusd computes the run-time checksum, from its answers to two probes of one write telegram that
+    differ only in the checksum byte (`EbusdClient.probe_write`): the correct checksum and the placeholder of the
+    definition. Neither probe is sent to the bus.
+
+    - "present": the correct checksum matched, the placeholder did not (the fork's build);
+    - "absent": the placeholder matched, the correct one did not (a stock ebusd compares the byte as written);
+    - "unknown": anything else."""
+    if matched_correct == "matched" and matched_placeholder == "not found":
+        return "present"
+    if matched_correct == "not found" and matched_placeholder == "matched":
+        return "absent"
+    return "unknown"
