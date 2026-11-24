@@ -9,7 +9,19 @@ from typing import Any
 
 from .guard import MAX_PER_HOUR, hourly_limit
 
-DEFAULT_METADATA_PATH = Path(__file__).resolve().parents[2] / "data" / "metadata.json"
+def _find_default_metadata() -> Path:
+    candidates = [
+        Path("/etc/weishaupt/metadata.json"),
+        Path(__file__).resolve().parents[2] / "data" / "metadata.json",
+        Path(__file__).resolve().parent / "metadata.json",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[0]
+
+
+DEFAULT_METADATA_PATH = _find_default_metadata()
 
 
 def _bool(value: Any, default: bool = False) -> bool:

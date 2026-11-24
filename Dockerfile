@@ -44,6 +44,7 @@ WORKDIR /app
 COPY pyproject.toml README.md /app/
 COPY src /app/src
 COPY data /app/data
+RUN mkdir -p /etc/weishaupt && cp /app/data/metadata.json /etc/weishaupt/metadata.json
 RUN pip install --no-cache-dir .
 
 COPY docker/run.sh /run.sh
