@@ -1,0 +1,91 @@
+# Example Home Assistant automation: sync upcoming closure events from a
+# `local_calendar` entity to Weishaupt room-unit native Holiday mode via MQTT
+# (`weishaupt2mqtt`).
+#
+# Why native Holiday mode?
+# - The controller itself enters setback/antifreeze at start_time and resumes
+#   normal heating automatically at end_time, even if Home Assistant or Wi-Fi
+#   is offline during the closure.
+# - Only 4 register writes per closure period (minimal EEPROM wear).
+#
+# Prerequisites:
+# - `weishaupt2mqtt` running with `writes_enabled: true` (or toggled on briefly
+#   by the automation via `weishaupt/bridge/config/set`).
+# - Adjust `calendar.closures` and the target circuits (`fs1`, `fs2`, `fs3`)
+#   to match your installation.
+
+alias: "Weishaupt — Sync native Holiday mode from closure calendar (MQTT)"
+description: >
+  Programs the room-unit Holiday start/end dates over MQTT whenever a new
+  multi-day closure approaches (24 h before start), ending the day before
+  reopening so morning pre-heating runs normally.
+mode: single
+
+triggers:
+  - trigger: time
+    at: "08:00:00"
+  - trigger: state
+    entity_id: calendar.closures
+    attribute: start_time
+
+conditions:
+  - condition: template
+    value_template: >
+      {% set start = state_attr('calendar.closures', 'start_time') %}
+      {% set end = state_attr('calendar.closures', 'end_time') %}
+      {% if not start or not end %}
+        false
+      {% else %}
+        {% set s = as_datetime(start) %}
+        {% set e = as_datetime(end) %}
+        {% set days_until = (s.date() - now().date()).days %}
+        {# Trigger when a closure starts within the next 2 days and lasts >= 1 day #}
+        {{ 0 <= days_until <= 2 and (e.date() - s.date()).days >= 1 }}
+      {% endif %}
+
+actions:
+  - variables:
+      start_dt: "{{ as_datetime(state_attr('calendar.closures', 'start_time')) }}"
+      # For all-day events, HA end_time is midnight of the reopening day;
+      # Weishaupt HolidayEnd is inclusive, so subtract 1 day.
+      end_dt: "{{ as_datetime(state_attr('calendar.closures', 'end_time')) - timedelta(days=1) }}"
+      circuits:
+        - fs1
+        - fs2
+        - fs3
+
+  # 1. Enable Level-1 user writes on weishaupt2mqtt
+  - action: mqtt.publish
+    data:
+      topic: weishaupt/bridge/config/set
+      qos: 1
+      payload: '{"writes_enabled": true}'
+
+  - delay: "00:00:02"
+
+  # 2. Program Holiday start/end dates on each room unit (Level 1 comfort registers)
+  - repeat:
+      for_each: "{{ circuits }}"
+      sequence:
+        - action: mqtt.publish
+          data:
+            topic: "weishaupt/{{ repeat.item }}/set"
+            qos: 1
+            payload: >
+              {{
+                {
+                  "HolidayStartDay": start_dt.day,
+                  "HolidayStartMonth": start_dt.month,
+                  "HolidayEndDay": end_dt.day,
+                  "HolidayEndMonth": end_dt.month,
+                  "HolidayTempLevel": "Antifreeze"
+                } | to_json
+              }}
+        - delay: "00:00:05"
+
+  # 3. Turn Level-1 writes back off immediately after programming
+  - action: mqtt.publish
+    data:
+      topic: weishaupt/bridge/config/set
+      qos: 1
+      payload: '{"writes_enabled": false}'
