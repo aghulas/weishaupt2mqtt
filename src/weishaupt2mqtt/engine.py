@@ -300,13 +300,20 @@ class WeishauptEngine:
                 if msg.poll not in poll_classes:
                     continue
                 try:
-                    max_age = 3600 if msg.passive else int(self.config.poll_cyclic_interval)
+                    if msg.passive:
+                        max_age = 3600
+                    elif msg.poll == "cyclic":
+                        max_age = int(self.config.poll_cyclic_interval)
+                    else:
+                        max_age = int(self.config.poll_program_interval)
                     raw = await self.client.read(circuit, msg.name, max_age=max_age)
                 except (EbusdNoData, EbusdNotFound):
                     continue
                 except EbusdError as err:
                     _LOGGER.debug("Read %s failed: %s", msg.key, err)
                     continue
+                if msg.poll == "on_demand":
+                    await asyncio.sleep(0.05)
                 valid, decoded = decode_message(msg, raw)
                 if not valid:
                     continue

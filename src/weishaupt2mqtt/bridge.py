@@ -258,10 +258,15 @@ async def run_forever(config: Config) -> None:
                             for c in await engine.poll_messages(("cyclic",)):
                                 await bridge.publish_circuit_state(c)
                         if tick % max(1, int(config.poll_program_interval / max(1.0, config.poll_passive_interval))) == 0:
+                            for c in await engine.poll_messages(("on_demand",)):
+                                await bridge.publish_circuit_state(c)
                             for c, pid in await engine.poll_programs():
                                 await bridge.publish_program(c, pid)
                             for c in await engine.poll_faults():
                                 await bridge.publish_faults(c)
+                        if config.clock_sync_enabled and tick % max(1, int(config.clock_sync_interval / max(1.0, config.poll_passive_interval))) == 0:
+                            await engine.update_bridge_config({"sync_clock": True})
+                            await bridge.publish_bridge_info()
                         tick += 1
                         await asyncio.sleep(config.poll_passive_interval)
 
