@@ -40,10 +40,10 @@ the manufacturer for an installation changed this way. Writes are off until you 
 - An MQTT broker (in Home Assistant: the **Mosquitto broker** add-on and the MQTT integration).
 - No other ebusd on the same adapter: stop an ebusd add-on or service that uses it. Running two
   was not tried.
-- **For entities in Home Assistant, read [Use it from Home Assistant](#use-it-from-home-assistant)
-  before you install**: the integration's entry has to be created against an ebusd add-on first,
-  and switched to the bridge afterwards. For MQTT alone (your own sensors, another tool) the
-  bridge is all you need.
+- For entities in Home Assistant, the integration ha-weishaupt **1.5.0 or later** (see
+  [Use it from Home Assistant](#use-it-from-home-assistant)); earlier versions cannot create
+  their entry with the bridge alone. For MQTT alone (your own sensors, another tool) the bridge is
+  all you need.
 
 ## Install as a Home Assistant add-on
 
@@ -213,22 +213,21 @@ in its `state` topic still carries the time of the last change of any of its val
 
 ## Use it from Home Assistant
 
-**With the integration [ha-weishaupt](https://github.com/aghulas/ha-weishaupt)** (1.4.0 or later):
-it builds the devices, entities, the panel and the confirmations from these topics, through Home
-Assistant's MQTT integration. In the entry of the integration: *⋮ → Reconfigure → Weishaupt2MQTT
-(MQTT bridge)*, give the base topic (`weishaupt`), submit. Devices, entities and history are kept.
+**With the integration [ha-weishaupt](https://github.com/aghulas/ha-weishaupt)**: it builds the
+devices, entities, the panel and the confirmations from these topics, through Home Assistant's
+MQTT integration.
 
-Version 1.4.1 of the integration can only **create** its entry against an ebusd it reaches over
-TCP, which this bridge does not offer. A first installation therefore goes:
+- **A new installation (integration 1.5.0 or later):** with the bridge running and
+  `weishaupt/bridge/state` at `online`, *Settings → Devices & services → Add integration →
+  Weishaupt → Weishaupt2MQTT (MQTT bridge)*, and give the base topic (`weishaupt`). No ebusd
+  add-on is needed. Run in the integration's tests; not yet done on a real Home Assistant.
+- **An existing entry in the ebusd mode (1.4.0 or later):** stop the ebusd add-on, start the
+  bridge, then on the entry *⋮ → Reconfigure → Weishaupt2MQTT (MQTT bridge)*, give the base topic,
+  submit. Devices, entities and history are kept. That is the path taken on the test
+  installation.
+- Versions 1.4.0 and 1.4.1 cannot create an entry with the bridge alone: update the integration
+  first.
 
-1. an ebusd add-on with the definitions, and the entry, as the integration's README describes
-   under *First installation: reading* (take the latest definitions, 1.3.1, where that text still
-   names 0.6.x);
-2. this bridge, with the ebusd add-on stopped;
-3. *Reconfigure* as above.
-
-That is the path taken on the test installation, which had a working entry before the bridge
-existed. Whether a lighter first step is enough (an ebusd without the definitions) was not tried.
 The integration's README, *With Weishaupt2MQTT (MQTT)*, says what differs in this mode.
 
 **Without it**, declare MQTT sensors yourself, for example:
@@ -425,7 +424,7 @@ Watch the time shown on a room unit after the first use.
 - **Settings are read once an hour** (every 5 minutes up to 0.1.3, by mistake): a change made on a
   controller shows late unless you ask for a `refresh`.
 - **Network adapters only as an add-on**; no TLS to the broker; no MQTT discovery.
-- **Integration:** version 1.4.1 cannot create its entry over MQTT alone (see above).
+- **Integration:** versions before 1.5.0 cannot create their entry with the bridge alone.
 - **Room unit 2, two copies of each circuit setting, absent sensors, the vendor's service tool:**
   the limits of the definitions apply as their release notice gives them.
 - `docs/automation-school-holidays.yaml` is an untested sketch: it sends the holiday dates to
