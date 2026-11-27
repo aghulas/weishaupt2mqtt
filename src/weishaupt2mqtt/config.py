@@ -70,7 +70,9 @@ class Config:
     # Definitions metadata
     metadata_path: Path = DEFAULT_METADATA_PATH
 
-    # Polling intervals (seconds)
+    # Polling intervals (seconds). Passive: what ebusd heard. Cyclic: live values ebusd asks for. Program: the
+    # settings and counters (on_demand, some 600 reads from the devices), and the weekly programs. Faults: the
+    # fault memory. Programs and fault memory are asked of the devices again only past their cache age.
     poll_passive_interval: float = 15.0
     poll_cyclic_interval: float = 60.0
     poll_program_interval: float = 3600.0
@@ -135,8 +137,8 @@ class Config:
             metadata_path=Path(metadata_val),
             poll_passive_interval=float(get("poll_passive_interval", "POLL_PASSIVE_INTERVAL", 15.0)),
             poll_cyclic_interval=float(get("poll_cyclic_interval", "POLL_CYCLIC_INTERVAL", 60.0)),
-            poll_program_interval=float(get("poll_program_interval", "POLL_PROGRAM_INTERVAL", 300.0)),
-            poll_faults_interval=float(get("poll_faults_interval", "POLL_FAULTS_INTERVAL", 300.0)),
+            poll_program_interval=float(get("poll_program_interval", "POLL_PROGRAM_INTERVAL", 3600.0)),
+            poll_faults_interval=float(get("poll_faults_interval", "POLL_FAULTS_INTERVAL", 3600.0)),
             writes_enabled=_bool(get("writes_enabled", "WRITES_ENABLED", False)),
             installer_writes_enabled=_bool(get("installer_writes_enabled", "INSTALLER_WRITES_ENABLED", False)),
             allow_stock_ebusd=_bool(get("allow_stock_ebusd", "ALLOW_STOCK_EBUSD", False)),
