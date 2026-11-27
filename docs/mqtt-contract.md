@@ -335,3 +335,35 @@ Standard `status` values:
     `weishaupt/fs1/program/heating1/set` → `{"days": {"1": ["06:30-18:00"]}}`
   - Installer setting (requires ACL on `weishaupt/+/installer/set` + `installer_writes_enabled`):
     `weishaupt/em2/installer/set` → `{"SupplyMaxTemp": 75.0, "confirm": true}`
+
+---
+
+## Where 0.1.3 differs from this contract
+
+Found by reading the code of `v0.1.3` and by running it without a bus (2026-11-27). The text above
+is the intended interface; until one side is changed, clients should expect the following.
+
+- **`bridge/state`** is `online` as soon as the bridge is connected to the broker. It does not
+  follow ebusd or the bus: a lost adapter, or a stopped reading loop, leaves it `online`. Use
+  `"_updated"` of a `<circuit>/state` topic to know that values are fresh.
+- **`bridge/info`** is published at start, after a `bridge/config/set` command, after a write that
+  succeeded and when a new device is found, not on every change of a field (`bus_signal`,
+  `used_last_hour`). The examples above show `"bridge_version": "0.1.0"` and an older ebusd
+  version; 0.1.3 with its bundled ebusd reports `0.1.3` and `26.1.p20261120`.
+- **`bridge/metadata`** is the whole metadata document, not filtered to the devices present, with
+  one field added to each message: `"mqtt_level"` (`user`, `installer` or `readonly`). The devices
+  present are `"circuits"` in `bridge/info`; there is no `present_circuits`.
+- **Clock.** `sync_clock` does not work: with writes on, the command fails inside the bridge
+  (logged as `MQTT connection error ('str' object has no attribute 'outside_temp')`, followed by a
+  reconnection) and nothing is sent; with writes off it is refused (`writes_disabled`). The option
+  `clock_sync_enabled` stops the reading loop at the end of its first pass. `"clock"` in
+  `bridge/info` stays `null`.
+- **`<circuit>/result`** is also published for `/installer/set`. A payload that is not a JSON
+  object gets a short result without `timestamp`, `circuit` or `target`.
+- **Refusal reasons** in use beyond the list above: `program_limit` (a program whose changed slots
+  do not fit the remaining hourly budget; `rate_limit` is the answer for a single setting),
+  `register_interval` (the same register written less than 10 s ago), `read_failed`,
+  `linked_unknown`, `source_not_own`, `capability_unknown`, and the `bad_day_…` family for a
+  malformed day of a program. A message name the bridge does not know is refused as `read_only`.
+- **Polling.** Settings and counters are read every 5 minutes, programs and the fault memory from
+  the devices once a day.
