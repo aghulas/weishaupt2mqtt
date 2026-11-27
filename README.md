@@ -473,3 +473,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests run against the bundled metadata, without a bus and without a broker.
+
+## License
+
+GPL-3.0, like ebusd and the Weishaupt definitions the container bundles. See `LICENSE`.
