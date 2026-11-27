@@ -27,7 +27,7 @@ supervision tools — operates the heating installation exclusively through this
 
 | Topic | Direction | Retain | Purpose |
 |---|---|---|---|
-| `weishaupt/bridge/state` | pub | yes | LWT availability: `online` or `offline` |
+| `weishaupt/bridge/state` | pub | yes | Availability: `online` while values are being read, `offline` otherwise (also the LWT) |
 | `weishaupt/bridge/info` | pub | yes | Bridge health, bus signal, write budget, versions |
 | `weishaupt/bridge/metadata` | pub | yes | Schema-1 metadata for the scanned devices (ranges, units, menus, risk classes) |
 | `weishaupt/bridge/config/set` | sub | no | Runtime bridge controls (`writes_enabled`, `sync_clock`, `refresh`) |
@@ -49,20 +49,33 @@ QoS 1 is recommended for all command (`/set`) and result (`/result`, `/journal`)
 
 ### `weishaupt/bridge/state` (retained)
 
-Plain text: `online` when connected to the broker and `ebusd` is reachable; `offline` published
-via MQTT Last Will and Testament (LWT) on unexpected disconnect, or explicitly on graceful shutdown.
+Plain text. `online` while the bridge is connected to the broker **and values are being read**:
+`ebusd` answers, it has a signal on the bus, and the reading loop works. `offline` in every other
+case: published by the bridge when one of the three fails (the reason is `health` in
+`bridge/info`), and by the broker as MQTT Last Will and Testament (LWT) when the bridge's
+connection drops. The bridge publishes `online` again by itself when reading works again.
+
+A loss of the bus is seen at the next question to ebusd about its state (once a minute with the
+default intervals), and ebusd itself takes some time to give its signal up.
 
 ### `weishaupt/bridge/info` (retained)
 
-Published at startup and whenever any field changes.
+Published at startup and whenever any field changes (looked at after each reading pass and every
+30 s).
 
 ```json
 {
-  "bridge_version": "0.1.0",
+  "bridge_version": "0.1.4",
   "definitions_version": "1.3.1",
-  "ebusd_version": "26.1.p20261029",
+  "ebusd_version": "26.1.p20261120",
   "run_time_checksum": "present",
   "bus_signal": true,
+  "health": {
+    "ok": true,
+    "reason": null,
+    "detail": null,
+    "since": "2026-11-24T15:58:10+01:00"
+  },
   "circuits": ["bc1", "bc2", "ka", "em1", "em2", "em3", "fs1", "fs2", "fs3"],
   "writes": {
     "enabled": true,
@@ -72,11 +85,29 @@ Published at startup and whenever any field changes.
     "max_per_hour": 30
   },
   "clock": {
+    "writable": true,
     "last_sync": "2026-11-24T16:00:00+01:00",
     "outside_temp": 7.5
   }
 }
 ```
+
+- `bus_signal`: ebusd answers and says it has a signal on the bus.
+- `health.ok`: what `bridge/state` shows as `online`. When `false`, `health.reason` is one of:
+
+  | `reason` | Meaning |
+  |---|---|
+  | `ebusd_unreachable` | ebusd does not answer on its command port |
+  | `no_bus_signal` | ebusd runs but hears nothing: adapter not reached, or bus down |
+  | `reading_failed` | the last reading pass ended on an error; `health.detail` names the step and the error. The loop goes on and the next pass that works clears it |
+  | `reading_stalled` | the reading loop did nothing for five minutes |
+
+  `health.since` is the time of the last change of `reason`.
+- `clock.writable`: ebusd loaded the write definition of the date and time broadcast and has
+  the address `31`, so a broadcast can be sent (the write switch is `writes.enabled`).
+  `clock.last_sync`: the last date and time broadcast the bridge sent (`null`: none since it
+  started); `clock.outside_temp`: the outside temperature of the clock master's broadcast it read
+  for it.
 
 ### `weishaupt/bridge/metadata` (retained)
 
@@ -100,12 +131,24 @@ Accepted keys (one or more per payload, optional `correlation_id`):
   the bridge). Turning it off also blocks *Heating engineer level* writes.
 - `installer_writes_enabled` (`bool`): separate switch for *Heating engineer level* writes on
   `/installer/set` (`false` by default, persisted by the bridge).
-- `sync_clock` (`true`): triggers an immediate clock broadcast at second `00` of the next minute,
-  preserving the last outside temperature from the clock master.
+- `sync_clock` (`true`): broadcasts the date and time of the bridge's host at second `00` of the
+  next minute, with the outside temperature of the clock master's last broadcast. Needs
+  `writes_enabled`, and counts as one write in the hourly budget. The result comes once the
+  broadcast is out, up to a minute after the command; commands received meanwhile are handled
+  after it. Nothing is sent, and the result is `refused`, when ebusd holds no broadcast of the
+  clock master yet (`clock_unknown`), when ebusd's own address is not `31` (`source_not_own`),
+  when ebusd has no write definition of the broadcast (`not_writable`), or when the connection to
+  ebusd was not free within 2 s of second `00` (`clock_late`: a late broadcast would set the
+  installation behind, so it is given up).
 - `refresh` (`"<circuit>/<message>"` or `["<circuit>/<message>", ...]`): forces an on-demand
   `read -f` of the listed message(s) and republishes `<circuit>/state`.
 
-Outcome is published on `weishaupt/bridge/result`.
+Outcome is published on `weishaupt/bridge/result`: `status` (`ok`, `refused` or `error`),
+`changed` (the keys that were applied) and, for `sync_clock`, `clock`: the journal entry below.
+
+The bridge option `clock_sync_enabled` sends the same broadcast by itself, one
+`clock_sync_interval` (30 minutes) after the start and then at that interval, under the same
+conditions; each attempt is an entry of `bridge/journal` with `"periodic": true`.
 
 ### `weishaupt/bridge/journal` (non-retained)
 
@@ -125,6 +168,29 @@ Emitted for every write attempt (setting, program, or clock), whether accepted, 
   "after": 20.5
 }
 ```
+
+A clock broadcast (`"kind": "clock"`):
+
+```json
+{
+  "timestamp": "2026-11-24T16:35:12+01:00",
+  "correlation_id": "req-44",
+  "kind": "clock",
+  "circuit": "broadcast",
+  "target": "Datetime",
+  "source": "31",
+  "periodic": false,
+  "offset_before": -42.0,
+  "requested": "2026-11-24 16:36:00",
+  "late": 0.004,
+  "status": "ok"
+}
+```
+
+`requested` is the local date and time the broadcast carries, `late` the seconds after second `00`
+at which it was handed to ebusd, `offset_before` the seconds the clock master was ahead of the
+bridge's host (absent when it cannot be told: the last broadcast held was the bridge's own, or an
+old one). A refused or failed one carries `reason` and `detail` instead of `late`.
 
 ---
 
@@ -317,7 +383,7 @@ Standard `status` values:
 | `confirmation_required` | Regulation setting sent without `"confirm": true`; nothing sent |
 | `refused` | Blocked by a guard before any bus write (`writes_disabled`, `installer_writes_disabled`, `installer_topic_required`, `wrong_level_topic`, `read_only`, `shared_with`, `out_of_range`, `linked_bound`, `invalid_step`, `rate_limit`, `stock_ebusd_not_allowed`, `invalid_payload`) |
 | `not_taken` | Sent and acknowledged on the bus, but read-back returned a different value |
-| `error` | Bus/ebusd error (no signal, timeout, connection lost) |
+| `error` | Bus/ebusd error (no signal, timeout, connection lost), or an error inside the bridge while it handled the command (`reason: "internal_error"`, logged by the bridge) |
 
 ---
 
@@ -338,32 +404,31 @@ Standard `status` values:
 
 ---
 
-## Where 0.1.3 differs from this contract
+## Where 0.1.4 differs from this contract
 
-Found by reading the code of `v0.1.3` and by running it without a bus (2026-11-27). The text above
-is the intended interface; until one side is changed, clients should expect the following.
+Found by reading the code and by running it without a bus (2026-11-27). The text above is the
+intended interface; until one side is changed, clients should expect the following.
 
-- **`bridge/state`** is `online` as soon as the bridge is connected to the broker. It does not
-  follow ebusd or the bus: a lost adapter, or a stopped reading loop, leaves it `online`. Use
-  `"_updated"` of a `<circuit>/state` topic to know that values are fresh.
-- **`bridge/info`** is published at start, after a `bridge/config/set` command, after a write that
-  succeeded and when a new device is found, not on every change of a field (`bus_signal`,
-  `used_last_hour`). The examples above show `"bridge_version": "0.1.0"` and an older ebusd
-  version; 0.1.3 with its bundled ebusd reports `0.1.3` and `26.1.p20261120`.
 - **`bridge/metadata`** is the whole metadata document, not filtered to the devices present, with
   one field added to each message: `"mqtt_level"` (`user`, `installer` or `readonly`). The devices
   present are `"circuits"` in `bridge/info`; there is no `present_circuits`.
-- **Clock.** `sync_clock` does not work: with writes on, the command fails inside the bridge
-  (logged as `MQTT connection error ('str' object has no attribute 'outside_temp')`, followed by a
-  reconnection) and nothing is sent; with writes off it is refused (`writes_disabled`). The option
-  `clock_sync_enabled` stops the reading loop at the end of its first pass. `"clock"` in
-  `bridge/info` stays `null`.
+- **Clock.** The date and time broadcast is written from the *End user level* switch
+  (`writes_enabled`) and without a confirmation, although the definitions class it as a
+  *Heating engineer level* setting. This version's broadcast was tested without a bus only.
 - **`<circuit>/result`** is also published for `/installer/set`. A payload that is not a JSON
   object gets a short result without `timestamp`, `circuit` or `target`.
 - **Refusal reasons** in use beyond the list above: `program_limit` (a program whose changed slots
   do not fit the remaining hourly budget; `rate_limit` is the answer for a single setting),
   `register_interval` (the same register written less than 10 s ago), `read_failed`,
-  `linked_unknown`, `source_not_own`, `capability_unknown`, and the `bad_day_…` family for a
-  malformed day of a program. A message name the bridge does not know is refused as `read_only`.
-- **Polling.** Settings and counters are read every 5 minutes, programs and the fault memory from
-  the devices once a day.
+  `linked_unknown`, `source_not_own`, `capability_unknown`, `not_writable`, `clock_unknown`,
+  `clock_late`, and the `bad_day_…` family for a malformed day of a program. A message name the
+  bridge does not know is refused as `read_only`.
+- **Polling.** Live values: every 15 s for what ebusd hears, every 60 s for what it asks for.
+  Settings and counters: every hour. Programs and the fault memory: from the devices once a day.
+  A setting changed on a controller itself therefore shows up to an hour later; `refresh` reads
+  it at once.
+
+Up to 0.1.3: `bridge/state` only followed the connection to the broker, `bridge/info` was not
+republished when `bus_signal` changed and had no `health`, `sync_clock` failed inside the bridge,
+the option `clock_sync_enabled` stopped the reading loop after its first pass, and settings and
+counters were read every 5 minutes.

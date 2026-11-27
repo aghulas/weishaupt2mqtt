@@ -80,7 +80,7 @@ published add-on.
 | `installer_writes_enabled` | `false` | Start value of the installer-level write switch. It only acts when `writes_enabled` is on too. |
 | `allow_stock_ebusd` | `false` | Only for `ebusd_external` with an official ebusd, which does not compute the write checksum: allow writes to the system manager, heating modules and room units with the placeholder checksum of the definitions. No effect with the bundled ebusd. |
 | `max_writes_per_hour` | `30` | Hourly write budget, 1 to 200. |
-| `clock_sync_enabled` | `false` | **Leave off in 0.1.3**, see [Known limits](#known-limits). |
+| `clock_sync_enabled` | `false` | `true`: the bridge sets the date and time of the installation from its own clock every 30 minutes (first time 30 minutes after the start). It is a write: it also needs `writes_enabled`. See [Set the date and time](#set-the-date-and-time) before switching it on. |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`, for the bridge (ebusd logs at `notice`). |
 
 The two write switches can also be changed while the bridge runs (see [Writing](#writing)); the
@@ -102,12 +102,16 @@ Each add-on option is an environment variable here: `EBUS_DEVICE`, `EBUSD_ADDRES
 `EBUSD_EXTERNAL`, `EBUSD_HOST`, `EBUSD_PORT`, `MQTT_HOST` (default `127.0.0.1`), `MQTT_PORT`,
 `MQTT_USERNAME`, `MQTT_PASSWORD`, `WEISHAUPT_BASE_TOPIC`, `WRITES_ENABLED`,
 `INSTALLER_WRITES_ENABLED`, `ALLOW_STOCK_EBUSD`, `MAX_WRITES_PER_HOUR`, `CLOCK_SYNC_ENABLED`,
-`LOG_LEVEL`. Give `-e MQTT_USERNAME=… -e MQTT_PASSWORD=…` where the broker asks for a login. Two
+`LOG_LEVEL`. Only as environment variables, in seconds: `POLL_PASSIVE_INTERVAL` (15),
+`POLL_CYCLIC_INTERVAL` (60), `POLL_PROGRAM_INTERVAL` (3600: settings, counters and programs),
+`POLL_FAULTS_INTERVAL` (3600: fault memory), `CLOCK_SYNC_INTERVAL` (1800). Give `-e MQTT_USERNAME=… -e MQTT_PASSWORD=…` where the broker asks for a login. Two
 differences from the add-on:
 
 - The write switches changed at run time are **not** kept over a restart unless you name a file
   for them on a volume: `-v weishaupt2mqtt:/data -e WEISHAUPT_STATE_FILE=/data/state.json`.
 - A serial adapter can be passed with Docker's `--device`; that was not tried.
+- A container runs in UTC unless told otherwise: give `-e TZ=<your time zone>` (for example
+  `Europe/Paris`) **before any use of the clock**, or the installation would be set to UTC.
 
 Without a container, against an ebusd you run yourself with the definitions loaded (Python 3.11 or
 later; the install must be the editable one, `-e`, for the bridge to find its metadata file):
@@ -134,7 +138,13 @@ Waiting for internal ebusd on 127.0.0.1:8888...
   by itself (`Discovered new circuits`).
 - `circuits=['broadcast']` alone and `checksum=unknown`, as above, mean ebusd found no device.
   Lines `[bus error] unable to open <address>:9999` repeated every few seconds mean ebusd does not
-  reach the adapter: check `ebus_device` and that nothing else holds the adapter.
+  reach the adapter: check `ebus_device` and that nothing else holds the adapter. The bridge then
+  publishes `offline` on `weishaupt/bridge/state`, and `online` by itself once ebusd has a signal.
+- `Bridge state offline: <reason>` and `Bridge state online: reading again` mark each change of
+  `weishaupt/bridge/state` after the start (reasons under [Check that it works](#check-that-it-works)).
+- `Reading pass <n>, step <name> failed`, followed by a Python traceback, is an error inside the
+  bridge: reading goes on with the next step, and the error is worth a report (see
+  [Report a problem](#report-a-problem)).
 - `MQTT connection error (…); reconnecting in 5 s` means the broker refuses or is not reached.
 - With `ebusd_external` and no ebusd answering, the bridge stops at once with
   `EbusdConnectionError: cannot connect to ebusd`.
@@ -158,8 +168,8 @@ What must appear, all retained (they are there at once for a new subscriber):
 
 | Topic | Content |
 |---|---|
-| `weishaupt/bridge/state` | `online` (the broker sets `offline` when the bridge's connection drops) |
-| `weishaupt/bridge/info` | versions, `"bus_signal"`, `"circuits"`, the write switches and the budget |
+| `weishaupt/bridge/state` | `online` while values are being read, `offline` otherwise |
+| `weishaupt/bridge/info` | versions, `"bus_signal"`, `"health"`, `"circuits"`, the write switches and the budget |
 | `weishaupt/bridge/metadata` | the metadata of the definitions (large) |
 | `weishaupt/<circuit>/state` | one JSON object per device code, keyed by message name, with `"_updated"` |
 | `weishaupt/<circuit>/program/<id>` | one per weekly program, by day |
@@ -169,24 +179,37 @@ What must appear, all retained (they are there at once for a new subscriber):
 `"circuits"` holds the device codes found on yours):
 
 ```json
-{"bridge_version": "0.1.3", "definitions_version": "1.3.1", "ebusd_version": "26.1.p20261120",
+{"bridge_version": "0.1.4", "definitions_version": "1.3.1", "ebusd_version": "26.1.p20261120",
  "run_time_checksum": "present", "bus_signal": true,
+ "health": {"ok": true, "reason": null, "detail": null, "since": "2026-11-27T11:41:02+01:00"},
  "circuits": ["bc1", "bc2", "ka", "em1", "em2", "em3", "fs1", "fs2", "fs3", "broadcast"],
  "writes": {"enabled": false, "installer_enabled": false, "allow_stock_ebusd": false,
             "used_last_hour": 0, "max_per_hour": 30},
- "clock": {"last_sync": null, "outside_temp": null}}
+ "clock": {"writable": true, "last_sync": null, "outside_temp": null}}
 ```
 
 The first pass reads every setting, the programs and the fault memory from the devices and is
 slow: on the test installation it took about a quarter of an hour before all topics were there.
 After it: live values are refreshed every 15 s from what
-ebusd hears and every 60 s for the values it must ask for, settings and counters every 5 minutes,
-programs and fault memory from the devices once a day.
+ebusd hears and every 60 s for the values it must ask for, settings and counters every hour,
+programs and fault memory from the devices once a day. A setting changed on a controller itself
+can therefore take an hour to show; `{"refresh": "<circuit>/<message>"}` on
+`weishaupt/bridge/config/set` reads one at once.
 
-**`online` is not proof that values are fresh.** `bridge/state` says the bridge is connected to
-the broker, and `bridge/info` is republished only on some events. To know that reading works,
-look at `"_updated"` in a `state` topic that changes all the time (`weishaupt/ka/state`): it
-carries the time of the last change of any value of that device.
+**What `online` means.** `bridge/state` is `online` while the bridge is connected to the broker,
+ebusd answers, ebusd has a signal on the bus and the reading loop works; otherwise `offline`.
+`"health"` in `bridge/info` gives the reason and since when:
+
+| `"reason"` | Meaning | Look at |
+|---|---|---|
+| `ebusd_unreachable` | ebusd does not answer | the log: did ebusd stop? |
+| `no_bus_signal` | ebusd runs but hears nothing | the adapter (power, network, `ebus_device`), another program holding it, the bus |
+| `reading_failed` | the last reading pass ended on an error, named in `"detail"` | the log; report it |
+| `reading_stalled` | the reading loop did nothing for five minutes | the log; restart the bridge; report it |
+
+A lost bus is noticed within about a minute, plus the time ebusd takes to give its signal up.
+`bridge/info` is published again whenever one of its fields changes. For one device, `"_updated"`
+in its `state` topic still carries the time of the last change of any of its values.
 
 ## Use it from Home Assistant
 
@@ -318,6 +341,38 @@ quarter hours, not overlapping; `[]` is off all day; days not named are left alo
 that differ are written, and none is written if they do not all fit in the hourly budget
 (`program_limit`).
 
+### Set the date and time
+
+The system manager broadcasts the date and time once a minute and takes over the time of any such
+broadcast it hears. The bridge can send one, carrying the clock of the machine it runs on:
+
+```bash
+mosquitto_pub -h <broker-address> -q 1 -t weishaupt/bridge/config/set -m '{"sync_clock": true}'
+```
+
+- **Check the bridge's clock and time zone first**: the whole installation takes them, programs
+  included. Home Assistant gives its time zone to its add-ons; with Docker, see
+  [Install with Docker](#install-with-docker). Either way, compare `"requested"` in the first
+  answer with your own clock.
+- It needs `writes_enabled` and counts as one write of the hourly budget. `"clock"` in
+  `bridge/info` must show `"writable": true` (ebusd loaded the write line of the broadcast, which
+  it does once it has found the devices).
+- The broadcast goes out at second 00 of the next minute, so the answer on
+  `weishaupt/bridge/result` (and the entry on `weishaupt/bridge/journal`, `"kind": "clock"`) comes
+  up to a minute after the command. Other commands wait meanwhile.
+- Nothing is sent, and the answer is `refused`, when ebusd has not heard a broadcast of the system
+  manager yet (`clock_unknown`: wait a minute after a start), or when the broadcast could not go
+  out within 2 s of second 00 (`clock_late`: sent late it would set the installation behind; ask
+  again).
+- The option `clock_sync_enabled` does the same every 30 minutes, the first time 30 minutes after
+  the start. With writes off each attempt is refused (`writes_disabled`) and nothing else happens.
+- To undo: there is nothing to restore; set the time again, here or on the system manager.
+
+**Not checked on a bus in this version.** The telegram and the timing are those the integration
+[ha-weishaupt](https://github.com/aghulas/ha-weishaupt) uses for its *set clock* button, which was
+checked on the test installation; the bridge's own sending was only run against a simulated ebusd.
+Watch the time shown on a room unit after the first use.
+
 ### The guards, in one place
 
 - Two switches, both off by default; the installer level needs both, and a `"confirm": true`.
@@ -359,14 +414,16 @@ that differ are written, and none is written if they do not all fit in the hourl
 ## Known limits
 
 - **One installation checked** (see the top).
-- **Clock (0.1.3): not usable.** With `clock_sync_enabled` on, the periodic step fails at the end
-  of the first reading pass and the bridge then publishes no new value, while `bridge/state` stays
-  `online`: leave the option off. The command `{"sync_clock": true}` fails as well when writes are
-  on (the bridge logs `MQTT connection error ('str' object has no attribute 'outside_temp')` and
-  reconnects) and sends nothing; `"clock"` in `bridge/info` stays empty.
-- **No health signal for reading.** A lost adapter or a stopped reading loop does not turn
-  `bridge/state` to `offline`, and `"bus_signal"` in the retained `bridge/info` is not refreshed
-  on its own. Watch `"_updated"` (see [Check that it works](#check-that-it-works)).
+- **Clock: sending not checked on a bus in 0.1.4** (see
+  [Set the date and time](#set-the-date-and-time)). It is written from the user-level switch and
+  without a confirmation, although the definitions class it as an installer-level setting. Up to
+  0.1.3 the option `clock_sync_enabled` stopped all reading after the first pass and the command
+  `sync_clock` failed: do not use the clock with those versions.
+- **Health follows ebusd's word.** `bridge/state` turns `offline` when ebusd says it has no
+  signal, about a minute after ebusd noticed. A device that stops answering while the bus is up
+  does not change it: its values simply stop moving (`"_updated"`).
+- **Settings are read once an hour** (every 5 minutes up to 0.1.3, by mistake): a change made on a
+  controller shows late unless you ask for a `refresh`.
 - **Network adapters only as an add-on**; no TLS to the broker; no MQTT discovery.
 - **Integration:** version 1.4.1 cannot create its entry over MQTT alone (see above).
 - **Room unit 2, two copies of each circuit setting, absent sensors, the vendor's service tool:**
