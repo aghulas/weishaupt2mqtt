@@ -24,6 +24,11 @@ class MqttBridge:
         self.engine = engine
         self.pub = publisher
         self.base = config.base_topic.strip("/")
+        self.tick = 0  # reading passes done on this connection
+        # errors of the MQTT connection itself: they leave `handle_message` and the reading loop (reconnection)
+        self.transport_errors: tuple[type[BaseException], ...] = ()
+        self._state: str | None = None  # last `bridge/state` published
+        self._info: str | None = None  # last `bridge/info` published
 
     def topic(self, suffix: str) -> str:
         return f"{self.base}/{suffix.lstrip('/')}"
@@ -37,13 +42,8 @@ class MqttBridge:
         ]
 
     async def publish_startup(self) -> None:
-        await self.pub.publish(self.topic("bridge/state"), "online", retain=True, qos=1)
-        await self.pub.publish(
-            self.topic("bridge/info"),
-            json.dumps(self.engine.bridge_info(), ensure_ascii=False),
-            retain=True,
-            qos=1,
-        )
+        self._state = self._info = None
+        await self.publish_health()
         await self.pub.publish(
             self.topic("bridge/metadata"),
             json.dumps(self.engine.filtered_metadata(), ensure_ascii=False),
@@ -52,12 +52,105 @@ class MqttBridge:
         )
 
     async def publish_bridge_info(self) -> None:
-        await self.pub.publish(
-            self.topic("bridge/info"),
-            json.dumps(self.engine.bridge_info(), ensure_ascii=False),
-            retain=True,
-            qos=1,
-        )
+        self._info = json.dumps(self.engine.bridge_info(), ensure_ascii=False)
+        await self.pub.publish(self.topic("bridge/info"), self._info, retain=True, qos=1)
+
+    async def publish_health(self) -> None:
+        """Publish `bridge/state` and `bridge/info` if they changed. `online` means values are being read:
+        ebusd answers, it has a signal on the bus and the reading loop works (`health` in `bridge/info`)."""
+        info = self.engine.bridge_info()
+        state = "online" if info["health"]["ok"] else "offline"
+        if state != self._state:
+            if self._state is not None:
+                _LOGGER.warning("Bridge state %s: %s", state, info["health"]["reason"] or "reading again")
+            self._state = state
+            await self.pub.publish(self.topic("bridge/state"), state, retain=True, qos=1)
+        if json.dumps(info, ensure_ascii=False) != self._info:
+            await self.publish_bridge_info()
+
+    async def publish_offline(self) -> None:
+        """Before a deliberate disconnection: the broker only sends the last will on an unexpected one."""
+        self._state = "offline"
+        await self.pub.publish(self.topic("bridge/state"), "offline", retain=True, qos=1)
+
+    def _due(self, interval: float) -> bool:
+        return self.tick % max(1, int(interval / max(1.0, self.config.poll_passive_interval))) == 0
+
+    async def poll_pass(self) -> None:
+        """One reading pass. Each step is tried on its own: the exception of one is logged, kept for `bridge/info`
+        (`health.reason` = `reading_failed`) and does not stop the others, nor the next pass. An ebusd that does
+        not answer ends the pass at once."""
+        engine, config = self.engine, self.config
+        errors: list[str] = []
+
+        async def step(name: str, action: Any, always: bool = False) -> None:
+            if not (always or engine.ebusd_reachable):
+                return
+            engine.touch()
+            try:
+                await action()
+            except self.transport_errors:
+                raise
+            except Exception as err:  # noqa: BLE001 - the reading loop must outlive any failure of a pass
+                _LOGGER.exception("Reading pass %d, step %s failed", self.tick, name)
+                errors.append(f"{name}: {type(err).__name__}: {err}")
+
+        async def states(*classes: str) -> None:
+            for circuit in await engine.poll_messages(classes):
+                await self.publish_circuit_state(circuit)
+
+        async def devices() -> None:
+            if await engine.refresh_devices():
+                await self.publish_bridge_info()
+
+        async def programs() -> None:
+            for circuit, program_id in await engine.poll_programs():
+                await self.publish_program(circuit, program_id)
+
+        async def fault_memory() -> None:
+            for circuit in await engine.poll_faults():
+                await self.publish_faults(circuit)
+
+        async def clock_broadcast() -> None:
+            entry = await engine.sync_clock(periodic=True)
+            await self.pub.publish(self.topic("bridge/journal"), json.dumps(entry, ensure_ascii=False), retain=False, qos=1)
+
+        try:
+            if self._due(config.poll_cyclic_interval) or not engine.ebusd_reachable:
+                await step("devices", devices, always=True)
+            await step("passive", lambda: states("passive"))
+            if self._due(config.poll_cyclic_interval):
+                await step("cyclic", lambda: states("cyclic"))
+            if self._due(config.poll_program_interval):
+                await step("settings", lambda: states("on_demand"))
+                await step("programs", programs)
+            if self._due(config.poll_faults_interval):
+                await step("faults", fault_memory)
+            if engine.clock_due():
+                await step("clock", clock_broadcast)
+        finally:
+            self.tick += 1
+            engine.touch()
+            engine.read_error = "; ".join(errors) or None
+        await self.publish_health()
+
+    async def poll_loop(self) -> None:
+        """Reading passes for as long as the connection lasts. Only cancellation and a failure of the MQTT
+        connection end it."""
+        while True:
+            try:
+                await self.poll_pass()
+            except self.transport_errors:
+                raise
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Reading pass failed outside its steps")
+            await asyncio.sleep(self.config.poll_passive_interval)
+
+    async def watch_health(self, period: float = 30.0) -> None:
+        """Beside the reading loop: publish the state when it changes while a pass is long or stuck."""
+        while True:
+            await asyncio.sleep(period)
+            await self.publish_health()
 
     async def publish_circuit_state(self, circuit: str) -> None:
         state = self.engine.states.get(circuit)
@@ -90,7 +183,23 @@ class MqttBridge:
             )
 
     async def handle_message(self, topic: str, raw_payload: str | bytes) -> None:
-        """Dispatch an incoming MQTT command message."""
+        """Handle an incoming MQTT command. No exception of a handler leaves this method (only a failure of the
+        MQTT connection does): it is logged and answered as `status: "error", reason: "internal_error"`."""
+        try:
+            await self._dispatch(topic, raw_payload)
+        except self.transport_errors:
+            raise
+        except Exception as err:  # noqa: BLE001 - one bad command must not take the command loop down
+            _LOGGER.exception("Command on %s failed", topic)
+            first = topic[len(self.base) + 1:].split("/")[0] if topic.startswith(self.base + "/") else "bridge"
+            await self.pub.publish(
+                self.topic(f"{first}/result"),
+                json.dumps({"status": "error", "reason": "internal_error", "detail": f"{type(err).__name__}: {err}"}),
+                retain=False,
+                qos=1,
+            )
+
+    async def _dispatch(self, topic: str, raw_payload: str | bytes) -> None:
         prefix = self.base + "/"
         if not topic.startswith(prefix):
             return
@@ -124,6 +233,10 @@ class MqttBridge:
         if parts == ["bridge", "config", "set"]:
             res = await self.engine.handle_bridge_config(payload)
             await self.pub.publish(self.topic("bridge/result"), json.dumps(res, ensure_ascii=False), retain=False, qos=1)
+            if "clock" in res:
+                await self.pub.publish(
+                    self.topic("bridge/journal"), json.dumps(res["clock"], ensure_ascii=False), retain=False, qos=1
+                )
             await self.publish_bridge_info()
             for item in res.get("changed", {}).get("refreshed", []):
                 await self.publish_circuit_state(item.split("/", 1)[0])
@@ -242,42 +355,40 @@ async def run_forever(config: Config) -> None:
                 will=will,
             ) as client:
                 bridge = MqttBridge(config, engine, _AiomqttAdapter(client))
+                bridge.transport_errors = (aiomqtt.MqttError,)
                 for sub in bridge.subscriptions():
                     await client.subscribe(sub, qos=1)
                 await bridge.publish_startup()
 
-                async def poll_loop() -> None:
-                    tick = 0
-                    while True:
-                        for c in await engine.poll_messages(("passive",)):
-                            await bridge.publish_circuit_state(c)
-                        if tick % max(1, int(config.poll_cyclic_interval / max(1.0, config.poll_passive_interval))) == 0:
-                            new_c = await engine.refresh_devices()
-                            if new_c:
-                                await bridge.publish_bridge_info()
-                            for c in await engine.poll_messages(("cyclic",)):
-                                await bridge.publish_circuit_state(c)
-                        if tick % max(1, int(config.poll_program_interval / max(1.0, config.poll_passive_interval))) == 0:
-                            for c in await engine.poll_messages(("on_demand",)):
-                                await bridge.publish_circuit_state(c)
-                            for c, pid in await engine.poll_programs():
-                                await bridge.publish_program(c, pid)
-                            for c in await engine.poll_faults():
-                                await bridge.publish_faults(c)
-                        if config.clock_sync_enabled and tick % max(1, int(config.clock_sync_interval / max(1.0, config.poll_passive_interval))) == 0:
-                            await engine.update_bridge_config({"sync_clock": True})
-                            await bridge.publish_bridge_info()
-                        tick += 1
-                        await asyncio.sleep(config.poll_passive_interval)
-
-                poller = asyncio.create_task(poll_loop())
-                try:
+                async def listen() -> None:
                     async for message in client.messages:
                         await bridge.handle_message(str(message.topic), message.payload)
+
+                tasks = {
+                    asyncio.create_task(bridge.poll_loop(), name="reading loop"),
+                    asyncio.create_task(bridge.watch_health(), name="health watch"),
+                    asyncio.create_task(listen(), name="command loop"),
+                }
+                try:
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 finally:
-                    poller.cancel()
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                # None of the three ends by itself: whichever did, say so and start over on a new connection.
+                for task in done:
+                    error = task.exception()
+                    if error is None or not isinstance(error, aiomqtt.MqttError):
+                        _LOGGER.error("The %s ended (%r): restarting on a new connection", task.get_name(), error)
+                        await bridge.publish_offline()
+                    if error is not None:
+                        raise error
+                raise RuntimeError("a loop of the bridge ended")
         except asyncio.CancelledError:
             raise
-        except Exception as err:
+        except (aiomqtt.MqttError, OSError) as err:
             _LOGGER.warning("MQTT connection error (%s); reconnecting in 5 s", err)
+            await asyncio.sleep(5.0)
+        except Exception as err:  # noqa: BLE001 - already logged with its loop above; never leave the bridge down
+            _LOGGER.warning("Bridge loops stopped (%r); starting again in 5 s", err)
             await asyncio.sleep(5.0)

@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import time
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +17,7 @@ from .ebusd import (
     EbusdConnectionError,
     EbusdError,
     EbusdInfo,
+    EbusdLate,
     EbusdNoData,
     EbusdNotFound,
 )
@@ -36,6 +39,10 @@ from .writes import WriteSpec, capability, linked, write_specs
 _LOGGER = logging.getLogger(__name__)
 PROBE_SETTING = "ka/BlockingTime"
 BOILER_CIRCUITS = frozenset({"bc1", "bc2"})
+CLOCK_KEY = "broadcast/Datetime"
+CLOCK_REGISTER = "fe:0700"  # key of the clock broadcast in the write guard
+CLOCK_QUIET = 1.0  # seconds before second 00 during which the reading loop sends nothing to ebusd
+STALL_AFTER = 300.0  # seconds without any reading activity after which the reading loop counts as stalled
 
 
 def _now_iso() -> str:
@@ -124,6 +131,21 @@ class WeishauptEngine:
         self.faults_state: dict[str, dict[str, Any]] = {}
         self.last_clock: clock.Broadcast | None = None
         self.last_clock_sync: str | None = None
+        self.clock_writable = False  # ebusd loaded the write definition of the date and time broadcast
+        self._clock_attempt = time.monotonic()  # the periodic broadcast first comes one interval after the start
+        # wall clock and sleep of the clock broadcast, replaced by the tests
+        self._now: Callable[[], datetime] = datetime.now
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._bus_free = asyncio.Event()  # cleared around second 00 of a clock broadcast
+        self._bus_free.set()
+
+        # Health of the reading side, shown in `bridge/info` and followed by `bridge/state`
+        self.ebusd_reachable = False
+        self.read_error: str | None = None  # the exception of the last reading pass, None when it went through
+        self.last_activity = time.monotonic()  # last time the reading loop did something
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._health_reason: str | None = None
+        self._health_since = _now_iso()
 
         # Pre-index program groups by (circuit, group_id)
         self._groups_by_circuit: dict[str, dict[str, Any]] = {}
@@ -166,6 +188,7 @@ class WeishauptEngine:
     async def start(self, *, wait_for_slaves: bool = False) -> None:
         """Query ebusd info, load definitions for present circuits, and probe write capability."""
         self.info = await self.client.info()
+        self.ebusd_reachable = True
         slave_addresses = {
             a.address for a in self.info.addresses.values() if a.role == "slave" and not a.own
         }
@@ -204,8 +227,7 @@ class WeishauptEngine:
                 _LOGGER.debug("Could not load write definitions for %s: %s", circuit, err)
                 loaded[circuit] = []
 
-        self.specs, _not_writable, self.placeholders = write_specs(self.model, loaded)
-        self.programs, self.slot_specs, _prog_issues = program_specs(self.model, loaded)
+        self._take_definitions(loaded)
 
         # Probe run-time checksum capability without writing to the bus
         probe_spec = self.specs.get(PROBE_SETTING) or next(iter(self.specs.values()), None)
@@ -225,12 +247,30 @@ class WeishauptEngine:
         else:
             self.checksum_capability = "unknown"
 
+    def _take_definitions(self, loaded: dict[str, list[Any]]) -> None:
+        self.specs, _not_writable, self.placeholders = write_specs(self.model, loaded)
+        self.programs, self.slot_specs, _prog_issues = program_specs(self.model, loaded)
+        message = self.model.messages.get(CLOCK_KEY)
+        self.clock_writable = bool(
+            message is not None and message.write is not None and message.write.source == "31"
+            and any(d.name == "Datetime" and d.direction == "w" and d.zz.lower() == "fe" and d.pbsb == "0700"
+                    for d in loaded.get("broadcast", [])))
+
     async def refresh_devices(self) -> list[str]:
-        """Check for newly discovered slave devices and load definitions if any new circuit appears."""
+        """Ask ebusd for its state (signal, devices) and load definitions if any new circuit appears."""
         try:
             self.info = await self.client.info()
-        except EbusdError:
+        except EbusdConnectionError as err:
+            if self.ebusd_reachable:
+                _LOGGER.warning("ebusd does not answer: %s", err)
+            self.ebusd_reachable = False
             return []
+        except EbusdError as err:
+            _LOGGER.warning("ebusd answered `info` with an error: %s", err)
+            return []
+        if not self.ebusd_reachable:
+            _LOGGER.info("ebusd answers again")
+        self.ebusd_reachable = True
         slave_addresses = {
             a.address for a in self.info.addresses.values() if a.role == "slave" and not a.own
         }
@@ -248,10 +288,33 @@ class WeishauptEngine:
                     loaded[circuit] = await self.client.definitions(circuit, write=True)
                 except EbusdError:
                     loaded[circuit] = []
-            self.specs, _not_writable, self.placeholders = write_specs(self.model, loaded)
-            self.programs, self.slot_specs, _prog_issues = program_specs(self.model, loaded)
+            self._take_definitions(loaded)
             _LOGGER.info("Discovered new circuits: %s (total %s)", new_circuits, self.present_circuits)
         return new_circuits
+
+    def touch(self) -> None:
+        """The reading loop is alive (for `reading_stalled`)."""
+        self.last_activity = self._monotonic()
+
+    def health(self) -> dict[str, Any]:
+        """Whether values are being read: `ok`, and when not, why (`reason`, `detail`), since when.
+
+        Reasons: `ebusd_unreachable`, `no_bus_signal` (ebusd runs but hears nothing: adapter or bus), `reading_failed`
+        (the last reading pass ended on an exception), `reading_stalled` (the reading loop did nothing for
+        `STALL_AFTER` seconds)."""
+        reason: str | None = None
+        detail: str | None = None
+        if not self.ebusd_reachable:
+            reason = "ebusd_unreachable"
+        elif self.info is None or not self.info.signal:
+            reason = "no_bus_signal"
+        elif self.read_error is not None:
+            reason, detail = "reading_failed", self.read_error
+        elif self._monotonic() - self.last_activity > STALL_AFTER:
+            reason = "reading_stalled"
+        if reason != self._health_reason:
+            self._health_reason, self._health_since = reason, _now_iso()
+        return {"ok": reason is None, "reason": reason, "detail": detail, "since": self._health_since}
 
     def bridge_info(self) -> dict[str, Any]:
         """Payload for `weishaupt/bridge/info`."""
@@ -260,7 +323,8 @@ class WeishauptEngine:
             "definitions_version": self.model.version,
             "ebusd_version": self.info.version if self.info else None,
             "run_time_checksum": self.checksum_capability,
-            "bus_signal": self.info.signal if self.info else False,
+            "bus_signal": bool(self.ebusd_reachable and self.info and self.info.signal),
+            "health": self.health(),
             "circuits": list(self.present_circuits),
             "writes": {
                 "enabled": self.guard.writes_enabled,
@@ -270,8 +334,9 @@ class WeishauptEngine:
                 "max_per_hour": self.guard.max_per_hour,
             },
             "clock": {
+                "writable": self.clock_writable and self.own_address == "31",
                 "last_sync": self.last_clock_sync,
-                "outside_temp": self.last_clock.outside_temp if self.last_clock else None,
+                "outside_temp": self.last_clock.outside if self.last_clock else None,
             },
         }
 
@@ -285,6 +350,17 @@ class WeishauptEngine:
             else:
                 msg["mqtt_level"] = "readonly"
         return meta
+
+    async def _poll_read(self, circuit: str, name: str, max_age: int) -> tuple[str, ...]:
+        """One read of the reading loop: not while a clock broadcast is about to go out. An ebusd that does not
+        answer is marked unreachable and ends the pass (EbusdConnectionError)."""
+        await self._bus_free.wait()
+        self.last_activity = self._monotonic()
+        try:
+            return await self.client.read(circuit, name, max_age=max_age)
+        except EbusdConnectionError:
+            self.ebusd_reachable = False
+            raise
 
     async def poll_messages(self, poll_classes: tuple[str, ...]) -> list[str]:
         """Poll messages matching `poll_classes` across present circuits. Returns changed circuits."""
@@ -306,9 +382,11 @@ class WeishauptEngine:
                         max_age = int(self.config.poll_cyclic_interval)
                     else:
                         max_age = int(self.config.poll_program_interval)
-                    raw = await self.client.read(circuit, msg.name, max_age=max_age)
+                    raw = await self._poll_read(circuit, msg.name, max_age)
                 except (EbusdNoData, EbusdNotFound):
                     continue
+                except EbusdConnectionError:
+                    raise
                 except EbusdError as err:
                     _LOGGER.debug("Read %s failed: %s", msg.key, err)
                     continue
@@ -349,7 +427,9 @@ class WeishauptEngine:
                         if msg.write and getattr(msg.write, "stored_only", False):
                             stored_only = True
                         try:
-                            raw_fields = await self.client.read(circuit, msg.name, max_age=self.config.program_cache_age)
+                            raw_fields = await self._poll_read(circuit, msg.name, self.config.program_cache_age)
+                        except EbusdConnectionError:
+                            raise
                         except EbusdError:
                             continue
                         raw_val = raw_of_fields(raw_fields)
@@ -389,7 +469,9 @@ class WeishauptEngine:
                     continue
                 if msg.family in ("fault_history", "fault_counters") or msg.name == "FaultPointer":
                     try:
-                        raw_map[msg.key] = await self.client.read(circuit, msg.name, max_age=self.config.faults_cache_age)
+                        raw_map[msg.key] = await self._poll_read(circuit, msg.name, self.config.faults_cache_age)
+                    except EbusdConnectionError:
+                        raise
                     except EbusdError:
                         continue
 
@@ -771,19 +853,95 @@ class WeishauptEngine:
                     refreshed.append(f"{circuit}/{msg_name}")
             changed["refreshed"] = refreshed
 
-        if payload.get("sync_clock") is True:
-            try:
-                self.guard.check_level(is_installer=False)
-                last = await self.client.last_broadcast_of_clock()
-                self.last_clock = last
-                now = datetime.now().astimezone()
-                tg = clock.telegram(now, last.outside_temp if last else None)
-                await self.client.write_broadcast(tg, lambda: True)
-                self.last_clock_sync = _now_iso()
+        result: dict[str, Any] = {**base, "status": "ok", "changed": changed}
+        if "sync_clock" in payload:
+            if payload["sync_clock"] is not True:
+                return {**base, "status": "refused", "reason": "invalid_payload", "detail": "sync_clock must be true",
+                        "changed": changed}
+            entry = await self.sync_clock(corr)
+            result["clock"] = entry
+            if entry["status"] == "ok":
                 changed["sync_clock"] = self.last_clock_sync
-            except WriteRefused as err:
-                return {**base, "status": "refused", "reason": err.code, "detail": str(err)}
-            except EbusdError as err:
-                return {**base, "status": "error", "reason": "ebusd_error", "detail": str(err)}
+            else:
+                result.update(status=entry["status"], reason=entry["reason"], detail=entry.get("detail"))
+        return result
 
-        return {**base, "status": "ok", "changed": changed}
+    def clock_due(self) -> bool:
+        """Whether the periodic clock broadcast (`clock_sync_enabled`) is due: one interval after the start, and
+        one interval after each attempt, whatever its outcome."""
+        return (self.config.clock_sync_enabled
+                and self._monotonic() - self._clock_attempt >= self.config.clock_sync_interval)
+
+    async def sync_clock(self, correlation_id: str | None = None, *, periodic: bool = False) -> dict[str, Any]:
+        """Broadcast the date and time of this host at second 00 of the next minute, or nothing.
+
+        Waits for that second (up to a minute), keeps the reading loop off ebusd for the last `CLOCK_QUIET`
+        seconds, and gives the broadcast up if the connection to ebusd is not free within `clock.LATE` seconds of
+        second 00: a late broadcast would set the whole installation behind. The outside temperature sent is the
+        one the clock master last broadcast; with no broadcast held by ebusd yet, nothing is sent. Returns the
+        journal entry (`kind: "clock"`); never raises for an ebusd or guard reason."""
+        self._clock_attempt = self._monotonic()
+        entry: dict[str, Any] = {
+            "timestamp": _now_iso(),
+            "correlation_id": correlation_id,
+            "kind": "clock",
+            "circuit": "broadcast",
+            "target": "Datetime",
+            "source": "31",
+            "periodic": periodic,
+        }
+        try:
+            self.guard.check_level(is_installer=False)
+            if not self.clock_writable:
+                raise WriteRefused("not_writable", setting=CLOCK_KEY,
+                                   reason="ebusd loaded no write definition of the date and time broadcast")
+            if self.own_address != "31":
+                raise WriteRefused("source_not_own", setting=CLOCK_KEY, own=self.own_address or "-")
+            try:
+                held = clock.parse_find(await self.client.last_broadcast_of_clock())
+            except (EbusdNoData, EbusdNotFound):
+                held = None
+            if held is None:
+                raise WriteRefused("clock_unknown")
+            self.last_clock = held
+            offset = clock.offset(held, self.own_address, self._now())
+            if offset is not None:
+                entry["offset_before"] = offset
+            self.guard.check_register(CLOCK_REGISTER, 0, 0, 0)
+
+            target = clock.next_minute(self._now())
+            telegram = clock.telegram(target, held.outside)
+            entry["requested"] = target.isoformat(sep=" ")
+            deadline = target + timedelta(seconds=clock.LATE)
+            try:
+                lead = (target - self._now()).total_seconds() - CLOCK_QUIET
+                if lead > 0:
+                    await self._sleep(lead)
+                self._bus_free.clear()
+                wait = (target - self._now()).total_seconds()
+                if wait > 0:
+                    await self._sleep(wait)
+                self.guard.record(CLOCK_REGISTER)
+                await self.client.write_broadcast(telegram, lambda: self._now() <= deadline)
+                entry["late"] = round((self._now() - target).total_seconds(), 3)
+            finally:
+                self._bus_free.set()
+                self.last_activity = self._monotonic()  # the wait is not a stall of the reading loop
+        except WriteRefused as err:
+            entry.update(status="refused", reason=err.code, detail=str(err))
+        except EbusdLate as err:
+            entry.update(status="refused", reason="clock_late",
+                         detail=str(WriteRefused("clock_late", late=f"{clock.LATE:g}")))
+            _LOGGER.warning("CLOCK %s given up: %s", entry.get("requested"), err)
+        except EbusdConnectionError as err:
+            entry.update(status="error", reason="unavailable", detail=str(err))
+        except EbusdError as err:
+            entry.update(status="error", reason="ebusd_error", detail=str(err))
+        else:
+            self.last_clock_sync = _now_iso()
+            entry["status"] = "ok"
+            _LOGGER.info("CLOCK %s sent (telegram %s from 31)", entry["requested"], telegram)
+        if entry["status"] != "ok" and entry.get("reason") != "clock_late":
+            _LOGGER.log(logging.WARNING if periodic else logging.INFO, "CLOCK not sent: %s (%s)",
+                        entry["reason"], entry.get("detail"))
+        return entry

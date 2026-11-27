@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from weishaupt2mqtt.bridge import MqttBridge
 from weishaupt2mqtt.config import Config
-from weishaupt2mqtt.ebusd import BusAddress, Definition, EbusdInfo, EbusdNoData, FieldDefinition
+from weishaupt2mqtt import clock
+from weishaupt2mqtt.ebusd import (
+    BusAddress,
+    Definition,
+    EbusdConnectionError,
+    EbusdInfo,
+    EbusdLate,
+    EbusdNoData,
+    FieldDefinition,
+)
 from weishaupt2mqtt.engine import WeishauptEngine, decode_message
 from weishaupt2mqtt.writes import crc
 
@@ -98,12 +109,26 @@ class FakeEbusdClient:
                 _wcrc_def("em2", "SupplyMinTemp", "51", "0602", "UIN", "10", "°C"),
             ],
             "bc1": [],
+            "broadcast": [
+                Definition("w", "Broadcast", "Datetime", "date and time", (), zz="fe", pbsb="0700", id=""),
+            ],
         }
+        self.signal = True
+        self.down = False  # ebusd does not answer at all
+        self.reads = 0
+        # what `find -p -h -vvv -c broadcast Datetime` answers; None: ebusd holds no broadcast yet
+        self.clock_find: str | None = _find_answer("10", datetime(2026, 11, 27, 10, 14, 0), 7.5,
+                                                   datetime(2026, 11, 27, 10, 14, 3))
+        self.broadcasts: list[tuple[str, datetime]] = []  # telegram, and the test's time when it went out
+        self.now: Any = None  # the test's clock, set by the tests of the clock
+        self.busy = 0.0  # seconds the connection to ebusd stays taken before a broadcast can go out
 
     async def info(self) -> EbusdInfo:
+        if self.down:
+            raise EbusdConnectionError("cannot connect to ebusd: refused")
         return EbusdInfo(
             version="ebusd 26.1.26.1" if self.stock_ebusd else "ebusd 26.1.p20261029",
-            signal=True,
+            signal=self.signal,
             addresses={
                 "31": BusAddress("31", "master", own=True),
                 "08": BusAddress("08", "slave", manufacturer="Kromschroeder", ident="W", files=("kromschroeder/08.w.bc1.csv",)),
@@ -125,7 +150,23 @@ class FakeEbusdClient:
             return "matched" if got == crc(reg) else "not found"
         return "matched" if got == crc(body) else "not found"
 
+    async def last_broadcast_of_clock(self) -> str:
+        if self.clock_find is None:
+            raise EbusdNoData("no data stored")
+        return self.clock_find
+
+    async def write_broadcast(self, telegram: str, in_time: Any) -> str:
+        if self.busy:
+            self.now.advance(self.busy)
+        if not in_time():
+            raise EbusdLate(f"not sent, too late: {telegram}")
+        self.broadcasts.append((telegram, self.now()))
+        return "done broadcast"
+
     async def read(self, circuit: str, name: str, max_age: int = 60) -> tuple[str, ...]:
+        if self.down:
+            raise EbusdConnectionError("cannot connect to ebusd: refused")
+        self.reads += 1
         if (circuit, name) not in self.values:
             raise EbusdNoData(f"{circuit}/{name}")
         return self.values[(circuit, name)]
@@ -160,6 +201,30 @@ class FakeEbusdClient:
         return "00"
 
 
+def _find_answer(source: str, carried: datetime, outside: float, received: datetime) -> str:
+    """The answer of ebusd to `find -p -h -vvv -c broadcast Datetime` for one broadcast."""
+    frame = source + clock.telegram(carried, outside)
+    return f"broadcast Datetime = {frame} / - [lastup={received:%Y-%m-%d %H:%M:%S}, active read]"
+
+
+class FakeTime:
+    """The wall clock and the sleep of the engine, in the hands of the test."""
+
+    def __init__(self, start: datetime) -> None:
+        self.value = start
+        self.slept: list[float] = []
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.advance(seconds)
+
+
 class FakePublisher:
     def __init__(self) -> None:
         self.messages: list[tuple[str, Any, bool]] = []
@@ -177,6 +242,9 @@ class FakePublisher:
                 return p
         raise AssertionError(f"No message published on {topic}")
 
+    def all(self, topic: str) -> list[Any]:
+        return [p for t, p, _ in self.messages if t == topic]
+
 
 class TestWeishaupt2Mqtt(unittest.IsolatedAsyncioTestCase):
     async def _make_bridge(
@@ -188,8 +256,10 @@ class TestWeishaupt2Mqtt(unittest.IsolatedAsyncioTestCase):
         allow_stock_ebusd: bool = False,
         max_writes_per_hour: int = 30,
         state_file: Path | None = None,
+        **more: Any,
     ) -> tuple[FakeEbusdClient, FakePublisher, WeishauptEngine, MqttBridge]:
         cfg = Config(
+            **more,
             writes_enabled=writes_enabled,
             installer_writes_enabled=installer_writes_enabled,
             allow_stock_ebusd=allow_stock_ebusd,
@@ -336,8 +406,268 @@ class TestWeishaupt2Mqtt(unittest.IsolatedAsyncioTestCase):
             persisted = json.loads(sf.read_text(encoding="utf-8"))
             self.assertEqual(persisted, {"writes_enabled": True, "installer_writes_enabled": True})
 
+    # ---- reading loop ---------------------------------------------------------------------------------------
+
+    async def test_reading_pass_with_clock_sync_enabled_goes_on(self) -> None:
+        """0.1.3 called a method that does not exist at the end of the first pass, which ended the loop."""
+        fake, pub, engine, bridge = await self._make_bridge(clock_sync_enabled=True, clock_sync_interval=1800.0)
+        await bridge.publish_startup()
+        engine._clock_attempt -= 1800.0  # the periodic broadcast is due
+        engine._now, engine._sleep = (now := FakeTime(datetime(2026, 11, 27, 10, 14, 20))), now.sleep
+        fake.now = now
+        await bridge.poll_pass()
+        self.assertIsNone(engine.read_error)
+        self.assertEqual(len(fake.broadcasts), 1)
+        self.assertEqual(pub.last("weishaupt/bridge/journal")["kind"], "clock")
+        self.assertTrue(pub.last("weishaupt/bridge/journal")["periodic"])
+        self.assertEqual(pub.last("weishaupt/ka/state")["OutsideTemp"], 7.5)
+        # the next pass reads again, and the clock is not due again
+        fake.values[("ka", "OutsideTemp")] = ("8.0",)
+        bridge.tick = 0  # a pass with every group, as the first one
+        await bridge.poll_pass()
+        self.assertEqual(pub.last("weishaupt/ka/state")["OutsideTemp"], 8.0)
+        self.assertEqual(len(fake.broadcasts), 1)
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "online")
+
+    async def test_periodic_clock_waits_one_interval(self) -> None:
+        fake, _, engine, bridge = await self._make_bridge(clock_sync_enabled=True)
+        await bridge.poll_pass()
+        self.assertEqual(fake.broadcasts, [])
+        self.assertFalse(engine.clock_due())
+
+    async def test_failing_step_is_logged_and_the_loop_survives(self) -> None:
+        fake, pub, engine, bridge = await self._make_bridge()
+        await bridge.publish_startup()
+        good = engine.poll_programs
+
+        async def broken() -> list[tuple[str, str]]:
+            raise AttributeError("no such thing")
+
+        engine.poll_programs = broken  # type: ignore[method-assign]
+        with self.assertLogs("weishaupt2mqtt.bridge", level="ERROR") as logs:
+            await bridge.poll_pass()
+        self.assertIn("step programs failed", logs.output[0])
+        # the other steps of the same pass were done
+        self.assertEqual(pub.last("weishaupt/ka/state")["OutsideTemp"], 7.5)
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "offline")
+        health = pub.last("weishaupt/bridge/info")["health"]
+        self.assertEqual((health["ok"], health["reason"]), (False, "reading_failed"))
+        self.assertIn("programs: AttributeError: no such thing", health["detail"])
+        # and a later pass that works brings the bridge back
+        engine.poll_programs = good  # type: ignore[method-assign]
+        bridge.tick = 0
+        await bridge.poll_pass()
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "online")
+        self.assertTrue(pub.last("weishaupt/bridge/info")["health"]["ok"])
+
+    async def test_poll_loop_outlives_a_failing_pass(self) -> None:
+        import asyncio
+
+        _, _, _, bridge = await self._make_bridge(poll_passive_interval=0.0)
+        calls = 0
+
+        async def failing_pass() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise asyncio.CancelledError
+            raise RuntimeError("pass broke")
+
+        bridge.poll_pass = failing_pass  # type: ignore[method-assign]
+        with self.assertLogs("weishaupt2mqtt.bridge", level="ERROR"):
+            with self.assertRaises(asyncio.CancelledError):
+                await bridge.poll_loop()
+        self.assertEqual(calls, 3)
+
+    # ---- health ---------------------------------------------------------------------------------------------
+
+    async def test_bus_signal_lost_and_back(self) -> None:
+        fake, pub, _, bridge = await self._make_bridge()
+        await bridge.publish_startup()
+        await bridge.poll_pass()
+        infos = len(pub.all("weishaupt/bridge/info"))
+        await bridge.poll_pass()  # nothing changed: nothing republished
+        self.assertEqual(len(pub.all("weishaupt/bridge/info")), infos)
+        self.assertEqual(pub.all("weishaupt/bridge/state"), ["online"])
+
+        fake.signal = False
+        bridge.tick = 0  # a pass that asks ebusd for its state
+        await bridge.poll_pass()
+        info = pub.last("weishaupt/bridge/info")
+        self.assertFalse(info["bus_signal"])
+        self.assertEqual(info["health"]["reason"], "no_bus_signal")
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "offline")
+
+        fake.signal = True
+        bridge.tick = 0
+        await bridge.poll_pass()
+        self.assertTrue(pub.last("weishaupt/bridge/info")["bus_signal"])
+        self.assertEqual(pub.all("weishaupt/bridge/state"), ["online", "offline", "online"])
+
+    async def test_ebusd_unreachable_ends_the_pass_and_is_retried(self) -> None:
+        fake, pub, engine, bridge = await self._make_bridge()
+        await bridge.publish_startup()
+        bridge.tick = 1  # a pass that does not ask ebusd for its state first
+        fake.down = True
+        await bridge.poll_pass()
+        self.assertFalse(engine.ebusd_reachable)
+        info = pub.last("weishaupt/bridge/info")
+        self.assertEqual(info["health"]["reason"], "ebusd_unreachable")
+        self.assertFalse(info["bus_signal"])
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "offline")
+        # while it is down, a pass only asks for its state
+        reads = fake.reads
+        await bridge.poll_pass()
+        self.assertEqual(fake.reads, reads)
+        fake.down = False
+        await bridge.poll_pass()
+        self.assertGreater(fake.reads, reads)
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "online")
+
+    async def test_stalled_reading_loop_is_reported(self) -> None:
+        _, pub, engine, bridge = await self._make_bridge()
+        await bridge.publish_startup()
+        engine.last_activity -= 301.0
+        await bridge.publish_health()  # what `watch_health` does beside the reading loop
+        self.assertEqual(pub.last("weishaupt/bridge/state"), "offline")
+        self.assertEqual(pub.last("weishaupt/bridge/info")["health"]["reason"], "reading_stalled")
+
+    # ---- commands -------------------------------------------------------------------------------------------
+
+    async def test_handler_exception_stays_inside(self) -> None:
+        _, pub, engine, bridge = await self._make_bridge()
+
+        async def broken(payload: dict[str, Any]) -> dict[str, Any]:
+            raise AttributeError("'str' object has no attribute 'outside_temp'")
+
+        engine.handle_bridge_config = broken  # type: ignore[method-assign]
+        with self.assertLogs("weishaupt2mqtt.bridge", level="ERROR"):
+            await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        res = pub.last("weishaupt/bridge/result")
+        self.assertEqual((res["status"], res["reason"]), ("error", "internal_error"))
+
+        class Broken(Exception):
+            pass
+
+        bridge.transport_errors = (Broken,)
+
+        async def lost(payload: dict[str, Any]) -> dict[str, Any]:
+            raise Broken
+
+        engine.handle_bridge_config = lost  # type: ignore[method-assign]
+        with self.assertRaises(Broken):  # the MQTT connection's own errors still end the loop
+            await bridge.handle_message("weishaupt/bridge/config/set", "{}")
+
+    # ---- clock ----------------------------------------------------------------------------------------------
+
+    async def _clock_bridge(self, at: datetime, **more: Any) -> tuple[FakeEbusdClient, FakePublisher, WeishauptEngine, MqttBridge, FakeTime]:
+        fake, pub, engine, bridge = await self._make_bridge(**more)
+        now = FakeTime(at)
+        engine._now, engine._sleep = now, now.sleep
+        fake.now = now
+        return fake, pub, engine, bridge, now
+
+    async def test_sync_clock_goes_out_at_second_00_of_the_minute_it_carries(self) -> None:
+        fake, pub, engine, bridge, now = await self._clock_bridge(datetime(2026, 11, 27, 10, 14, 20, 250000))
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True, "correlation_id": "k1"}))
+        res = pub.last("weishaupt/bridge/result")
+        self.assertEqual(res["status"], "ok", res)
+        self.assertEqual(res["correlation_id"], "k1")
+        target = datetime(2026, 11, 27, 10, 15, 0)
+        # one broadcast, sent at second 00 exactly, carrying that minute and the master's outside temperature
+        self.assertEqual(fake.broadcasts, [(clock.telegram(target, 7.5), target)])
+        self.assertEqual(fake.broadcasts[0][0], "fe0700098007001510271105" + "26")
+        self.assertAlmostEqual(sum(now.slept), 39.75)
+        self.assertTrue(engine._bus_free.is_set())
+        entry = pub.last("weishaupt/bridge/journal")
+        self.assertEqual((entry["kind"], entry["status"], entry["source"]), ("clock", "ok", "31"))
+        self.assertEqual(entry["requested"], "2026-11-27 10:15:00")
+        self.assertEqual(entry["late"], 0.0)
+        info = pub.last("weishaupt/bridge/info")
+        self.assertEqual(info["clock"]["outside_temp"], 7.5)
+        self.assertTrue(info["clock"]["writable"])
+        self.assertIsNotNone(info["clock"]["last_sync"])
+        self.assertEqual(info["writes"]["used_last_hour"], 1)
+
+    async def test_sync_clock_given_up_when_late(self) -> None:
+        fake, pub, engine, bridge, _ = await self._clock_bridge(datetime(2026, 11, 27, 10, 14, 50))
+        fake.busy = clock.LATE + 0.5  # the connection to ebusd is taken past the deadline
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        res = pub.last("weishaupt/bridge/result")
+        self.assertEqual((res["status"], res["reason"]), ("refused", "clock_late"))
+        self.assertEqual(fake.broadcasts, [])
+        self.assertIsNone(engine.last_clock_sync)
+        self.assertTrue(engine._bus_free.is_set())
+
+    async def test_sync_clock_slightly_late_is_sent(self) -> None:
+        fake, pub, _, bridge, _ = await self._clock_bridge(datetime(2026, 11, 27, 10, 14, 50))
+        fake.busy = clock.LATE - 0.5
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["status"], "ok")
+        self.assertEqual(pub.last("weishaupt/bridge/journal")["late"], clock.LATE - 0.5)
+        self.assertEqual(len(fake.broadcasts), 1)
+
+    async def test_sync_clock_without_a_broadcast_held_is_refused(self) -> None:
+        for answer in (None, "broadcast Datetime = no data stored", ""):
+            fake, pub, _, bridge, now = await self._clock_bridge(datetime(2026, 11, 27, 10, 14, 50))
+            fake.clock_find = answer
+            await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+            res = pub.last("weishaupt/bridge/result")
+            self.assertEqual((res["status"], res["reason"]), ("refused", "clock_unknown"), answer)
+            self.assertEqual(fake.broadcasts, [])
+            self.assertEqual(now.slept, [])
+            self.assertEqual(pub.last("weishaupt/bridge/journal")["reason"], "clock_unknown")
+
+    async def test_sync_clock_refusals_before_anything_is_sent(self) -> None:
+        when = datetime(2026, 11, 27, 10, 14, 50)
+        fake, pub, _, bridge, _ = await self._clock_bridge(when, writes_enabled=False)
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["reason"], "writes_disabled")
+
+        fake, pub, engine, bridge, _ = await self._clock_bridge(when)
+        engine.clock_writable = False  # ebusd without the write definition of the broadcast
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["reason"], "not_writable")
+
+        fake, pub, engine, bridge, _ = await self._clock_bridge(when)
+        engine.own_address = "01"
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["reason"], "source_not_own")
+
+        fake, pub, _, bridge, _ = await self._clock_bridge(when)
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": "now"}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["reason"], "invalid_payload")
+        # twice within ten seconds: the second one is refused by the write guard
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        await bridge.handle_message("weishaupt/bridge/config/set", json.dumps({"sync_clock": True}))
+        self.assertEqual(pub.last("weishaupt/bridge/result")["reason"], "register_interval")
+        self.assertEqual(len(fake.broadcasts), 1)
+
+    async def test_reading_waits_while_the_broadcast_goes_out(self) -> None:
+        import asyncio
+
+        fake, _, engine, _ = await self._make_bridge()
+        engine._bus_free.clear()
+        read = asyncio.create_task(engine.poll_messages(("passive",)))
+        await asyncio.sleep(0.01)
+        self.assertEqual(fake.reads, 0)
+        engine._bus_free.set()
+        await read
+        self.assertGreater(fake.reads, 0)
+
+    # ---- configuration --------------------------------------------------------------------------------------
+
+    def test_polling_defaults_are_the_same_everywhere(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {}, clear=True):
+            loaded = Config.from_sources()
+        for name in ("poll_passive_interval", "poll_cyclic_interval", "poll_program_interval",
+                     "poll_faults_interval", "clock_sync_interval", "clock_sync_enabled"):
+            self.assertEqual(getattr(loaded, name), getattr(Config(), name), name)
+        self.assertEqual(loaded.poll_program_interval, 3600.0)
+
     def test_supervisor_mqtt_auto_discovery(self) -> None:
-        import os
         from unittest.mock import MagicMock, patch
 
         with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "mock-token"}):

@@ -31,6 +31,8 @@ REASONS = {
     "program_limit": "{needed} slots to write exceeds {left} writes left within the hour (limit {limit})",
     "read_failed": "{setting} could not be read before write ({reason})",
     "unavailable": "ebusd is not reachable",
+    "clock_unknown": "ebusd holds no date and time broadcast of the clock master yet: nothing sent",
+    "clock_late": "ebusd was not free within {late} s of second 00: the broadcast was given up, not sent late",
     "invalid_payload": "invalid command payload: {reason}",
     "bad_day_format": "{day}: {part!r} is not a valid range (expected HH:MM-HH:MM)",
     "bad_day_quarter": "{day}: {part}: times must be in 15-minute steps (00:00 to 24:00)",
